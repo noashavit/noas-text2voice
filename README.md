@@ -1,7 +1,7 @@
 <img width="80" height="80" alt="noas-icon" src="https://github.com/user-attachments/assets/e71f9c41-a674-4fed-8676-d6704529d2b4" />
 
 # Bookmark to audiobook with text-to-voice
-An agent to help you get to all those "Read later" items using free tools.
+An agent to help you get to all those "read later" items using free tools.
 
 Automatically converts new bookmarks you save to Raindrop.io into an MP3 audiobook and emails it to you. 
 The agent runs every 5 mins and batches audiobooks based on the bookmarks added in a 30 mins window. It then emails the audiofile to you. Totally hands free.
@@ -14,7 +14,7 @@ Once converted, the agent sends the audio file straight to your inbox (currently
 ## How it works
 
 1. **Tag** any article or PDF in Raindrop.io with `Later`
-2. **Wait**: the agent runs every 5 minutes and batches bookmarks for 30 minutes (so everything you save in one sitting lands in one file)
+2. **Wait**: the agent runs every 30 minutes and batches bookmarks for 5 minutes (so everything you save in one sitting lands in one file)
 3. **Listen**: a single MP3 arrives in your inbox, with each article announced as a chapter
 
 ---
@@ -92,7 +92,7 @@ Once converted, the agent sends the audio file straight to your inbox (currently
 | `GMAILPASSWORD` | Your 16-character App Password |
 | `DBTABLE` | `text2voice_items` |
 | `LATERTAG` | `Later` |
-| `BATCHDELAY` | `30` |
+| `BATCHDELAY` | `5` |
 
 > Type key names directly — do not copy/paste them, as invisible spaces can cause errors.
 
@@ -117,10 +117,10 @@ Then in Lambda → **Code** tab → **Upload from → .zip file** → select `la
 
 ---
 
-### Step 8 — Set up the 5-minute trigger
+### Step 8 — Set up the 30-minute trigger
 1. In Lambda → **Add trigger** → choose **EventBridge (CloudWatch Events)**
 2. Create a new rule → type: **Schedule expression**
-3. Value: `rate(5 minutes)`
+3. Value: `rate(30 minutes)`
 4. Click **Add**
 
 ---
@@ -144,7 +144,7 @@ Then in Lambda → **Code** tab → **Upload from → .zip file** → select `la
 | `ELEVENLABSVOICE` | No | `21m00Tcm4TlvDq8ikWAM` | ElevenLabs voice ID |
 | `DBTABLE` | No | `text2voice_items` | DynamoDB table name |
 | `LATERTAG` | No | `Later` | Raindrop.io tag to watch |
-| `BATCHDELAY` | No | `30` | Minutes to wait before processing |
+| `BATCHDELAY` | No | `5` | Minutes to wait before processing |
 
 ---
 
