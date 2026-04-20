@@ -1,16 +1,21 @@
-# Later Text2Voice
+<img width="80" height="80" alt="noas-icon" src="https://github.com/user-attachments/assets/e71f9c41-a674-4fed-8676-d6704529d2b4" />
 
-Automatically converts your saved Raindrop.io bookmarks into a single MP3 audiobook and emails it to you — hands free.
+# Bookmark to Audiobook with Text-to-Voice
+An agent to help you get to all those "Read later" items using free tools.
 
-Tag any article or PDF in Raindrop.io with `Later`. Every 30 minutes, the agent batches everything you tagged, converts it to speech using ElevenLabs, and sends the audio file straight to your Gmail inbox.
+Automatically converts new bookmarks you save to Raindrop.io into an MP3 audiobook and emails it to you. 
+The agent runs every 5 mins and batches audiobooks based on the bookmarks added in a 30 mins window. It then emails the audiofile to you. Totally hands free.
+
+Simply save and tag any article or PDF in Raindrop.io with `Later`. The agent batches everything you tagged every 30 mins and converts it to speech using ElevenLabs. 
+Once converted, the agent sends the audio file straight to your inbox (currently only supporting Gmail).
 
 ---
 
 ## How it works
 
 1. **Tag** any article or PDF in Raindrop.io with `Later`
-2. **Wait** — the agent runs every 5 minutes and batches bookmarks for 30 minutes (so everything you save in one sitting lands in one file)
-3. **Listen** — a single MP3 arrives in your inbox, with each article announced as a chapter
+2. **Wait**: the agent runs every 5 minutes and batches bookmarks for 30 minutes (so everything you save in one sitting lands in one file)
+3. **Listen**: a single MP3 arrives in your inbox, with each article announced as a chapter
 
 ---
 
@@ -164,3 +169,14 @@ deploy.sh            Packages the agent into a Lambda-ready ZIP
 | `AudioBuilder` | Assembles chapters into a single MP3 |
 | `EmailNotifier` | Sends the MP3 via Gmail SMTP |
 | `Orchestrator` | Wires all modules together |
+
+## Known limitations
+
+- Only supports Raindrop.io free bookmark manager
+- Only support Gmail email clients
+- Only tested in Mac and iPhone, support for other systems isn't garunteed  
+---
+
+## Built by
+
+[Noa Shavit](https://www.linkedin.com/in/noashavit), product marketer and AI builder based in San Francisco.
