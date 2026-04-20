@@ -1,6 +1,6 @@
 <img width="80" height="80" alt="noas-icon" src="https://github.com/user-attachments/assets/e71f9c41-a674-4fed-8676-d6704529d2b4" />
 
-# Bookmark to Audiobook with Text-to-Voice
+# Bookmark to audiobook with text-to-voice
 An agent to help you get to all those "Read later" items using free tools.
 
 Automatically converts new bookmarks you save to Raindrop.io into an MP3 audiobook and emails it to you. 
