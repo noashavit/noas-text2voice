@@ -4,9 +4,9 @@
 An agent to help you get to all those "read later" items using free tools.
 
 Automatically converts new bookmarks you save to Raindrop.io into an MP3 audiobook and emails it to you. 
-The agent runs every 5 mins and batches audiobooks based on the bookmarks added in a 30 mins window. It then emails the audiofile to you. Totally hands free.
+The agent runs every 30 minutes and batches audiobooks based on the bookmarks added in a 5-minute window. It then emails the audio file to you. Totally hands free.
 
-Simply save and tag any article or PDF in Raindrop.io with `Later`. The agent batches everything you tagged every 30 mins and converts it to speech using ElevenLabs. 
+Simply save and tag any article or PDF in Raindrop.io with `Later`. The agent batches everything you tagged and converts it to speech using AWS Polly.
 Once converted, the agent sends the audio file straight to your inbox (currently only supporting Gmail).
 
 ---
@@ -14,7 +14,7 @@ Once converted, the agent sends the audio file straight to your inbox (currently
 ## How it works
 
 1. **Tag** any article or PDF in Raindrop.io with `Later`
-2. **Wait**: the agent runs every 30 minutes and batches bookmarks for 5 minutes (so everything you save in one sitting lands in one file)
+2. **Wait**: the agent runs every 30 minutes and batches bookmarks saved within a 5-minute window (so everything you save in one sitting lands in one file)
 3. **Listen**: a single MP3 arrives in your inbox, with each article announced as a chapter
 
 ---
@@ -25,7 +25,7 @@ Once converted, the agent sends the audio file straight to your inbox (currently
 |---|---|---|
 | Runtime | AWS Lambda | Free tier |
 | State | AWS DynamoDB | Free tier |
-| Voice | ElevenLabs API | Free (10k chars/month) |
+| Voice | AWS Polly | Free tier (5M chars/month for 12 months) |
 | Email | Gmail SMTP | Free |
 | Bookmarks | Raindrop.io API | Free |
 
@@ -37,7 +37,6 @@ Once converted, the agent sends the audio file straight to your inbox (currently
 
 - An [AWS account](https://aws.amazon.com) (free tier)
 - A [Raindrop.io](https://raindrop.io) account
-- An [ElevenLabs](https://elevenlabs.io) account (free tier)
 - A Gmail account with [2-Step Verification](https://myaccount.google.com/security) enabled
 - Python 3.11 installed on your Mac (`brew install python3`)
 
@@ -50,16 +49,7 @@ Once converted, the agent sends the audio file straight to your inbox (currently
 
 ---
 
-### Step 2 — ElevenLabs API key
-1. Sign up at [elevenlabs.io](https://elevenlabs.io)
-2. Go to Settings → API Keys → copy your key
-3. When creating the key, enable only: **Text to Speech → Access** and **Voices → Read**
-
-> **Free tier limit:** 10,000 characters/month ≈ 1–2 average articles. Upgrade to the $5/month Starter plan for more.
-
----
-
-### Step 3 — Gmail App Password
+### Step 2 — Gmail App Password
 1. Go to [myaccount.google.com/security](https://myaccount.google.com/security)
 2. Confirm 2-Step Verification is on
 3. Search for **App Passwords** → create one named `Later T2S`
@@ -67,7 +57,7 @@ Once converted, the agent sends the audio file straight to your inbox (currently
 
 ---
 
-### Step 4 — Create a DynamoDB table
+### Step 3 — Create a DynamoDB table
 1. Open [AWS Console](https://console.aws.amazon.com) → search **DynamoDB** → **Create table**
 2. Table name: `text2voice_items`
 3. Partition key: `raindrop_id` (type: String)
@@ -75,37 +65,39 @@ Once converted, the agent sends the audio file straight to your inbox (currently
 
 ---
 
-### Step 5 — Create the Lambda function
+### Step 4 — Create the Lambda function
 1. In AWS Console → search **Lambda** → **Create function**
 2. Choose **Author from scratch**
 3. Name: `text2voice-agent`, Runtime: **Python 3.11**
 4. Click **Create function**
-5. Go to **Configuration → General configuration** → set Timeout to **14 minutes**
+5. Go to **Configuration → General configuration** → set Timeout to **14 minutes** and Memory to **512 MB**
 6. Go to **Configuration → Environment variables** → add the following:
 
 | Key | Value |
 |---|---|
 | `RAINDROPTOKEN` | Your Raindrop.io test token |
-| `ELEVENLABSKEY` | Your ElevenLabs API key |
-| `ELEVENLABSVOICE` | `21m00Tcm4TlvDq8ikWAM` |
 | `GMAILADDRESS` | Your Gmail address |
 | `GMAILPASSWORD` | Your 16-character App Password |
 | `DBTABLE` | `text2voice_items` |
 | `LATERTAG` | `Later` |
 | `BATCHDELAY` | `5` |
+| `POLLYVOICE` | `Joanna` |
+| `POLLYENGINE` | `standard` |
+| `MAXCHARS` | `8000` |
 
 > Type key names directly — do not copy/paste them, as invisible spaces can cause errors.
 
 ---
 
-### Step 6 — Give Lambda permission to use DynamoDB
+### Step 5 — Give Lambda permission to use DynamoDB and Polly
 1. In your Lambda function → **Configuration → Permissions** → click the role name
 2. In IAM → **Add permissions → Attach policies**
 3. Search `AmazonDynamoDBFullAccess` → check it → **Add permissions**
+4. Repeat and search `AmazonPollyFullAccess` → check it → **Add permissions**
 
 ---
 
-### Step 7 — Deploy the code
+### Step 6 — Deploy the code
 In Terminal:
 ```bash
 cd "/path/to/this/repo"
@@ -117,7 +109,7 @@ Then in Lambda → **Code** tab → **Upload from → .zip file** → select `la
 
 ---
 
-### Step 8 — Set up the 30-minute trigger
+### Step 7 — Set up the 30-minute trigger
 1. In Lambda → **Add trigger** → choose **EventBridge (CloudWatch Events)**
 2. Create a new rule → type: **Schedule expression**
 3. Value: `rate(30 minutes)`
@@ -125,11 +117,11 @@ Then in Lambda → **Code** tab → **Upload from → .zip file** → select `la
 
 ---
 
-### Step 9 — Test it
+### Step 8 — Test it
 1. Add a bookmark in Raindrop.io and tag it `Later`
 2. In Lambda → **Test** → create a test event → click **Test**
 3. Check the logs — you should see the bookmark detected and queued
-4. After 30 minutes, click **Test** again — the MP3 will be generated and emailed to you
+4. After 5 minutes, click **Test** again — the MP3 will be generated and emailed to you
 
 ---
 
@@ -138,13 +130,14 @@ Then in Lambda → **Code** tab → **Upload from → .zip file** → select `la
 | Key | Required | Default | Description |
 |---|---|---|---|
 | `RAINDROPTOKEN` | Yes | — | Raindrop.io test token |
-| `ELEVENLABSKEY` | Yes | — | ElevenLabs API key |
 | `GMAILADDRESS` | Yes | — | Gmail address (send + receive) |
 | `GMAILPASSWORD` | Yes | — | Gmail App Password |
-| `ELEVENLABSVOICE` | No | `21m00Tcm4TlvDq8ikWAM` | ElevenLabs voice ID |
 | `DBTABLE` | No | `text2voice_items` | DynamoDB table name |
 | `LATERTAG` | No | `Later` | Raindrop.io tag to watch |
 | `BATCHDELAY` | No | `5` | Minutes to wait before processing |
+| `POLLYVOICE` | No | `Joanna` | AWS Polly voice ID |
+| `POLLYENGINE` | No | `standard` | AWS Polly engine (`standard` or `neural`) |
+| `MAXCHARS` | No | `8000` | Max characters per article before truncation |
 
 ---
 
@@ -164,8 +157,8 @@ deploy.sh            Packages the agent into a Lambda-ready ZIP
 | `Config` | Loads all settings from environment variables |
 | `StateManager` | Reads/writes bookmark state to DynamoDB |
 | `RaindropMonitor` | Fetches and filters bookmarks from Raindrop.io |
-| `ContentExtractor` | Pulls text from web pages and PDFs |
-| `TTSConverter` | Sends text to ElevenLabs, handles chunking and rate limits |
+| `ContentExtractor` | Extracts article text from web pages (via trafilatura) and PDFs (via pdfminer), with garbled-content filtering and a BeautifulSoup fallback |
+| `TTSConverter` | Sends text to AWS Polly, handles chunking and retries |
 | `AudioBuilder` | Assembles chapters into a single MP3 |
 | `EmailNotifier` | Sends the MP3 via Gmail SMTP |
 | `Orchestrator` | Wires all modules together |
@@ -173,8 +166,9 @@ deploy.sh            Packages the agent into a Lambda-ready ZIP
 ## Known limitations
 
 - Only supports Raindrop.io free bookmark manager
-- Only support Gmail email clients
-- Only tested in Mac and iPhone, support for other systems isn't garunteed  
+- Only supports Gmail email clients
+- Only tested on Mac and iPhone; support for other systems isn't guaranteed
+
 ---
 
 ## Built by

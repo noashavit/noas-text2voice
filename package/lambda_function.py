@@ -10,25 +10,32 @@ WHAT THIS DOES (plain English):
   2. Any new ones get queued in DynamoDB with a 30-minute timer
   3. Bookmarks added within that 30-minute window are grouped into one audio file
   4. After 30 minutes, extracts text from each bookmark (PDF or webpage)
-  5. Converts all text to speech via ElevenLabs, with "Chapter N: Title" announcements
+  5. Converts all text to speech via AWS Polly, with "Chapter N: Title" announcements
   6. Combines everything into one MP3 and emails it to you via Gmail
 
 ENVIRONMENT VARIABLES (set these in Lambda → Configuration → Environment variables):
   RAINDROPTOKEN     Your Raindrop.io test token
-  ELEVENLABSKEY     Your ElevenLabs API key
   GMAILADDRESS      Your Gmail address (used to send AND receive)
   GMAILPASSWORD     A Gmail App Password (NOT your real password — see setup guide)
 
-  ELEVENLABSVOICE   (optional) Default: 21m00Tcm4TlvDq8ikWAM (Rachel voice)
+  POLLYVOICE        (optional) Default: Joanna — see voice list below
+  POLLYENGINE       (optional) Default: neural — "neural" sounds natural, "standard" saves quota
   DBTABLE           (optional) Default: text2voice_items
   LATERTAG          (optional) Default: Later
   BATCHDELAY        (optional) Default: 30
+  MAXCHARS          (optional) Default: 30000 — max chars per article before truncating
 
 FREE TIER NOTES:
-  - AWS Lambda:    1M requests/month free → you'll use ~9,000/month (every 5 min)
+  - AWS Lambda:    1M requests/month free
   - DynamoDB:      25 GB free forever
-  - ElevenLabs:    10,000 characters/month free (~1-2 average articles)
-  - Gmail:         Free forever, 500 emails/day (more than enough)
+  - AWS Polly:     5M standard chars/month free for 12 months (1M neural chars/month)
+  - Gmail:         Free forever, 500 emails/day
+
+POLLY VOICE OPTIONS (set via POLLYVOICE env var):
+  Joanna, Kendra, Kimberly, Salli   — US English, female
+  Matthew, Joey, Justin             — US English, male
+  Amy, Emma                         — British English, female
+  Brian                             — British English, male
 
 DEPENDENCIES (pip install these into a folder before zipping — see deploy.sh):
   requests, pdfminer.six, beautifulsoup4, pydub, boto3
@@ -49,8 +56,12 @@ from email import encoders
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
+import re
+from collections import Counter
+
 import boto3
 import requests
+import trafilatura
 from botocore.exceptions import ClientError
 from bs4 import BeautifulSoup
 from pdfminer.high_level import extract_text as pdf_extract_text
@@ -73,25 +84,30 @@ log = logging.getLogger("text2voice")
 # ─────────────────────────────────────────────────────────────────────────────
 class Config:
     # Required — Lambda will fail immediately with a clear KeyError if missing
-    RAINDROP_TOKEN = os.environ["RAINDROPTOKEN"]
-    ELEVENLABS_API_KEY = os.environ["ELEVENLABSKEY"]
-    GMAIL_ADDRESS = os.environ["GMAILADDRESS"]
-    GMAIL_APP_PASSWORD = os.environ["GMAILPASSWORD"]
+    RAINDROP_TOKEN = os.environ["RAINDROPTOKEN"].strip()
+    GMAIL_ADDRESS = os.environ["GMAILADDRESS"].strip()
+    GMAIL_APP_PASSWORD = os.environ["GMAILPASSWORD"].strip()
 
     # Optional with sensible defaults
-    # Voice ID "21m00Tcm4TlvDq8ikWAM" = Rachel (warm, clear American English)
-    # Browse all voices at: https://elevenlabs.io/app/voice-library
-    ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABSVOICE", "21m00Tcm4TlvDq8ikWAM")
     DYNAMODB_TABLE = os.environ.get("DBTABLE", "text2voice_items")
     LATER_TAG = os.environ.get("LATERTAG", "Later").lstrip("#")  # strip # if accidentally included
     BATCH_DELAY_MINUTES = int(os.environ.get("BATCHDELAY", "30"))
     AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
-    # ElevenLabs API limits
-    # Free tier: 10,000 chars/month. Each API call: max ~4,500 chars (safe limit).
-    ELEVENLABS_CHUNK_SIZE = 4500
-    # Seconds to wait between ElevenLabs API calls to avoid rate-limit errors
-    ELEVENLABS_RATE_DELAY = 1.5
+    # AWS Polly TTS settings
+    # Free tier: 5 million characters/month for 12 months (neural voices: 1M/month)
+    # Neural voices sound much more natural — use "standard" engine to save quota
+    # Available neural voices: Joanna, Matthew, Amy, Brian, Emma, Joey, Kendra...
+    # Full list: https://docs.aws.amazon.com/polly/latest/dg/ntts-voices-main.html
+    POLLY_VOICE = os.environ.get("POLLYVOICE", "Joanna")
+    # "standard" works in all AWS regions. "neural" sounds more natural but is
+    # only available in select regions (us-east-1, us-west-2, eu-west-1, etc.)
+    # If you get a ValidationException about engine not supported, use "standard".
+    POLLY_ENGINE = os.environ.get("POLLYENGINE", "standard")
+
+    # Max characters per article to avoid Lambda timeouts on very long documents
+    # Polly is fast (~1s per chunk) so 30,000 chars is safe within Lambda's 14-min limit
+    MAX_CHARS_PER_ARTICLE = int(os.environ.get("MAXCHARS", "30000"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,10 +152,12 @@ class StateManager:
         """
         now = datetime.now(timezone.utc)
 
-        # Look for any pending item whose batch window hasn't expired yet
+        # Look for any pending item whose batch window hasn't expired yet.
+        # #pa aliases "process_after" — DynamoDB's reserved word "AFTER" can
+        # cause silent failures when attribute names are used without aliases.
         resp = self.table.scan(
-            FilterExpression="#s = :pending AND process_after > :now",
-            ExpressionAttributeNames={"#s": "status"},
+            FilterExpression="#s = :pending AND #pa > :now",
+            ExpressionAttributeNames={"#s": "status", "#pa": "process_after"},
             ExpressionAttributeValues={
                 ":pending": "pending",
                 ":now": now.isoformat(),
@@ -178,6 +196,7 @@ class StateManager:
                     "link": item["link"],
                     "item_type": item["item_type"],
                     "file_url": item.get("file_url", ""),
+                    "excerpt": item.get("excerpt", ""),
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 },
                 # Don't overwrite if it already exists (prevents double-processing)
@@ -192,20 +211,55 @@ class StateManager:
 
     def get_ready_batches(self) -> Dict[str, List[Dict]]:
         """
-        Find all 'pending' batches whose 30-minute timer has expired.
+        Find all 'pending' batches whose timer has expired.
         Returns a dict of {batch_id: [list of items in that batch]}.
+
+        Uses #pa as an alias for "process_after" — required because DynamoDB
+        treats AFTER as a reserved word and silently drops unaliased attributes
+        from filter expressions, causing the scan to always return nothing.
         """
         now = datetime.now(timezone.utc)
-        resp = self.table.scan(
-            FilterExpression="#s = :pending AND process_after <= :now",
+        now_str = now.isoformat()
+        log.info("Phase 2 scan — current time: %s", now_str)
+
+        # First: log ALL pending items in the table so we can see their state
+        debug_resp = self.table.scan(
+            FilterExpression="#s = :pending",
             ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":pending": "pending"},
+        )
+        for row in debug_resp.get("Items", []):
+            log.info(
+                "DynamoDB item: '%s' | process_after: %s | ready: %s",
+                row.get("title"),
+                row.get("process_after"),
+                row.get("process_after", "") <= now_str,
+            )
+
+        # Now fetch only the items whose timer has expired
+        resp = self.table.scan(
+            FilterExpression="#s = :pending AND #pa <= :now",
+            ExpressionAttributeNames={"#s": "status", "#pa": "process_after"},
             ExpressionAttributeValues={
                 ":pending": "pending",
-                ":now": now.isoformat(),
+                ":now": now_str,
             },
         )
+        items = resp.get("Items", [])
+
+        # Handle DynamoDB pagination — scan returns max 1MB per call
+        while "LastEvaluatedKey" in resp:
+            resp = self.table.scan(
+                FilterExpression="#s = :pending AND #pa <= :now",
+                ExpressionAttributeNames={"#s": "status", "#pa": "process_after"},
+                ExpressionAttributeValues={":pending": "pending", ":now": now_str},
+                ExclusiveStartKey=resp["LastEvaluatedKey"],
+            )
+            items.extend(resp.get("Items", []))
+
+        log.info("%d item(s) ready to process", len(items))
         batches: Dict[str, List[Dict]] = {}
-        for row in resp.get("Items", []):
+        for row in items:
             batches.setdefault(row["batch_id"], []).append(row)
         return batches
 
@@ -294,6 +348,7 @@ class RaindropMonitor:
                 "link": bm.get("link", ""),
                 "item_type": bm.get("type", "link"),
                 "file_url": file_url,
+                "excerpt": bm.get("excerpt", ""),  # Raindrop's stored preview — used as fallback
             })
             log.info("New bookmark: [%s] %s", raindrop_id, bm.get("title"))
 
@@ -305,27 +360,41 @@ class RaindropMonitor:
 #
 # Given a bookmark URL, extracts the readable text from it.
 #
-# For PDFs: downloads the file and uses pdfminer.six to extract text
-# For web pages: fetches the HTML and uses BeautifulSoup to find the main
-#   content, stripping navigation, headers, footers, and ads.
+# For web pages: trafilatura is the primary extractor — it is purpose-built to
+#   strip navigation, metadata, ads, and code from HTML, including React/Next.js
+#   pages. BeautifulSoup is kept as a fallback for sites trafilatura can't parse.
 #
-# NOTE: Some websites block scrapers (paywall, JS-only content). For those,
-# extraction will return empty string and the chapter will be skipped with
-# a warning in the logs. Selenium support can be added later for JS-heavy pages.
+# For PDFs: pdfminer.six extracts raw text, then a cleaning pass removes lines
+#   with garbled/non-printable characters (bad font encodings), repeated
+#   headers/footers, and page numbers.
+#
+# Both paths run a final sanity check: if the result still contains too many
+# non-prose characters (code symbols, escape sequences), it is discarded and the
+# Raindrop excerpt is used instead.
 # ─────────────────────────────────────────────────────────────────────────────
 class ContentExtractor:
-    # Pretend to be a real browser so websites don't block us
+    # Full browser headers — many sites check for Accept/Accept-Language in
+    # addition to User-Agent and return 403 if they look bot-like
     BROWSER_HEADERS = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-        )
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     }
-    # HTML elements that contain navigation/ads/boilerplate — strip before extracting
+    # HTML elements that contain navigation/ads/boilerplate — used by the
+    # BeautifulSoup fallback path; trafilatura handles this internally.
     NOISE_TAGS = [
         "nav", "header", "footer", "aside", "script", "style",
         "noscript", "iframe", "figure", "figcaption", "form",
     ]
+    # Characters that appear in code/JSON/CSS but rarely in prose.
+    # If these make up more than 12% of the extracted text, it is likely garbage.
+    CODE_CHARS = set('{}[]\\|<>=_^~`@$')
 
     def extract(self, item: Dict) -> str:
         """
@@ -339,11 +408,39 @@ class ContentExtractor:
             return ""
         try:
             if self._is_pdf(url):
-                return self._extract_pdf(url)
-            return self._extract_webpage(url)
+                text = self._extract_pdf(url)
+            else:
+                text = self._extract_webpage(url)
         except Exception as exc:
             log.error("Extraction failed for '%s': %s", item["title"], exc)
-            return ""
+            text = ""
+
+        # Sanity check: if the text is too garbled (too many code/symbol chars),
+        # discard it. This catches cases where extraction "succeeds" but returns
+        # minified JS, JSON blobs, or font-encoding garbage instead of prose.
+        if text and not self._is_clean_text(text):
+            log.warning(
+                "'%s': extracted text failed sanity check (too many code characters) — discarding.",
+                item["title"],
+            )
+            text = ""
+
+        if text:
+            return text
+
+        # Final fallback: the short excerpt Raindrop stores for every bookmark.
+        # Not the full article, but better than skipping the chapter entirely.
+        excerpt = item.get("excerpt", "").strip()
+        if excerpt:
+            log.info(
+                "Using Raindrop excerpt as fallback for '%s' (%d chars)",
+                item["title"], len(excerpt),
+            )
+            return (
+                f"Note: the full article could not be retrieved from this website. "
+                f"Here is a short preview:\n\n{excerpt}"
+            )
+        return ""
 
     def _is_pdf(self, url: str) -> bool:
         """Check if a URL points to a PDF (by extension, then by Content-Type header)."""
@@ -358,34 +455,171 @@ class ContentExtractor:
             return False
 
     def _extract_pdf(self, url: str) -> str:
-        """Download a PDF and extract its text using pdfminer.six."""
+        """Download a PDF and extract its text, then filter out garbled lines."""
         log.info("Extracting PDF: %s", url)
         resp = requests.get(url, headers=self.BROWSER_HEADERS, timeout=30)
         resp.raise_for_status()
-        text = pdf_extract_text(io.BytesIO(resp.content))
-        return self._clean(text)
+        raw = pdf_extract_text(io.BytesIO(resp.content))
+        filtered = self._filter_pdf_text(raw)
+        log.info(
+            "PDF extraction: %d raw chars → %d after filtering", len(raw), len(filtered)
+        )
+        return self._clean(filtered)
+
+    def _filter_pdf_text(self, text: str) -> str:
+        """
+        Remove common PDF artifacts from pdfminer output:
+
+        1. Garbled lines — PDFs with embedded custom fonts and no Unicode mapping
+           produce strings of random characters. We detect these by checking what
+           fraction of each line's characters fall outside printable ASCII.
+
+        2. Repeated short lines — page headers and footers (e.g. "Databricks | 2025",
+           "CONFIDENTIAL") repeat on every page. Any short line that appears more than
+           twice is almost certainly a running header or footer.
+
+        3. Page numbers — lines that are just a number, or match patterns like
+           "Page 3 of 12" or "3 / 12".
+        """
+        lines = text.splitlines()
+
+        # Count how often each short line appears (long lines are never headers)
+        short_line_counts = Counter(
+            ln.strip() for ln in lines
+            if ln.strip() and len(ln.strip()) < 80
+        )
+
+        # How many non-empty lines are there total? Used to set the repeat threshold.
+        total_nonempty = sum(1 for ln in lines if ln.strip())
+        # A line repeated in more than 5% of all lines is treated as a header/footer.
+        # Floor of 3 so we don't over-filter very short documents.
+        repeat_threshold = max(3, total_nonempty * 0.05)
+
+        page_number_re = re.compile(
+            r"^\d+$"                          # bare number: "12"
+            r"|^[Pp]age\s+\d+(\s+of\s+\d+)?$"  # "Page 3" or "Page 3 of 12"
+            r"|^\d+\s*/\s*\d+$"              # "3 / 12"
+        )
+
+        filtered = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                filtered.append("")
+                continue
+
+            # Drop repeated header/footer lines
+            if len(stripped) < 80 and short_line_counts[stripped] > repeat_threshold:
+                continue
+
+            # Drop page number lines
+            if page_number_re.match(stripped):
+                continue
+
+            # Drop lines with too many non-printable or non-ASCII characters.
+            # Garbled font encoding shows up as characters with ord > 127 or < 32.
+            non_printable = sum(
+                1 for c in stripped
+                if ord(c) > 127 or (ord(c) < 32 and c not in "\t")
+            )
+            if non_printable / len(stripped) > 0.20:
+                continue
+
+            filtered.append(line)
+
+        return "\n".join(filtered)
 
     def _extract_webpage(self, url: str) -> str:
-        """Fetch a webpage and extract the main readable content."""
+        """
+        Fetch a webpage and extract the main readable content.
+
+        Uses trafilatura as the primary extractor — it scores each text block by
+        how much it resembles prose vs. boilerplate (navigation, metadata, ads,
+        code) and discards anything that doesn't look like article content.
+
+        Falls back to BeautifulSoup if trafilatura returns nothing (e.g. paywalled
+        pages or sites that serve a near-empty HTML shell with JS-only content).
+        """
         log.info("Extracting webpage: %s", url)
         resp = requests.get(url, headers=self.BROWSER_HEADERS, timeout=15)
         resp.raise_for_status()
+
+        # ── Primary: trafilatura ────────────────────────────────────────────
+        # favor_precision=True tells trafilatura to skip any block it isn't
+        # confident about — we'd rather have less text than garbled text.
+        try:
+            text = trafilatura.extract(
+                resp.text,
+                url=url,           # helps trafilatura apply site-specific heuristics
+                include_comments=False,
+                include_tables=False,
+                favor_precision=True,
+                no_fallback=False,  # allow trafilatura's own fallback extractors
+            )
+        except Exception as exc:
+            log.warning("trafilatura raised an exception for %s: %s", url, exc)
+            text = None
+
+        if text and text.strip():
+            log.info(
+                "trafilatura extracted %d chars from %s. Preview: %s",
+                len(text), url, repr(text[:300]),
+            )
+            return self._clean(text)
+
+        log.info("trafilatura returned nothing for %s", url)
+
+        log.info("trafilatura returned nothing for %s — falling back to BeautifulSoup", url)
+
+        # ── Fallback: BeautifulSoup ─────────────────────────────────────────
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Remove clutter elements first
         for tag_name in self.NOISE_TAGS:
             for el in soup.find_all(tag_name):
                 el.decompose()
 
-        # Look for the main content area using semantic HTML tags (best practice)
-        content = (
+        container = (
             soup.find("article")
             or soup.find("main")
             or soup.find(attrs={"role": "main"})
             or soup.find("body")
             or soup
         )
-        return self._clean(content.get_text(separator="\n"))
+
+        # Only collect text from known prose elements — avoids picking up
+        # JSON blobs and template code that frameworks embed in div/span elements.
+        prose_tags = ["h1", "h2", "h3", "h4", "p", "li", "blockquote"]
+        blocks = []
+        for el in container.find_all(prose_tags):
+            t = el.get_text(separator=" ").strip()
+            if len(t) > 20:
+                blocks.append(t)
+
+        if blocks:
+            return self._clean("\n".join(blocks))
+
+        return self._clean(container.get_text(separator="\n"))
+
+    @staticmethod
+    def _is_clean_text(text: str) -> bool:
+        """
+        Return True if the text looks like readable prose.
+        Return False if it appears to be code, JSON, minified CSS, or font garbage.
+
+        We measure what fraction of characters are typical code/symbol characters.
+        Prose articles very rarely exceed 5%. We use 12% as a generous threshold
+        to avoid false positives on articles that discuss code topics.
+        """
+        if not text or len(text) < 50:
+            return False
+        code_char_count = sum(1 for c in text if c in ContentExtractor.CODE_CHARS)
+        ratio = code_char_count / len(text)
+        if ratio > 0.12:
+            log.warning(
+                "Text sanity check: %.1f%% code characters — treating as garbled.", ratio * 100
+            )
+            return False
+        return True
 
     @staticmethod
     def _clean(text: str) -> str:
@@ -395,86 +629,55 @@ class ContentExtractor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TTS CONVERTER — ElevenLabs
+# TTS CONVERTER — AWS Polly
 #
-# Converts text to MP3 audio bytes using the ElevenLabs API.
+# Converts text to MP3 audio bytes using AWS Polly — Amazon's text-to-speech
+# service. Already integrated with your AWS account via boto3 (no new packages,
+# no new API keys). Just needs AmazonPollyFullAccess added to the Lambda IAM role.
 #
-# Key challenges handled here:
-#   1. CHUNKING: ElevenLabs has a per-request character limit (~5000 chars).
-#      Long articles are split at sentence boundaries and converted in parts,
-#      then the audio chunks are merged back into one.
-#   2. RATE LIMITS: If we hit the API limit, we wait with exponential backoff
-#      and retry (e.g. wait 2s, then 4s, then 8s...).
+# Free tier: 5 million standard characters/month for 12 months.
+#            1 million neural characters/month for 12 months.
+# After free tier: ~$4 per million standard chars (very cheap).
 #
-# API docs: https://elevenlabs.io/docs/api-reference/text-to-speech
+# Polly's per-request limit is 3,000 characters, so long articles are chunked
+# at sentence boundaries and the resulting MP3 parts are concatenated.
+#
+# Docs: https://docs.aws.amazon.com/polly/latest/dg/API_SynthesizeSpeech.html
 # ─────────────────────────────────────────────────────────────────────────────
 class TTSConverter:
-    TTS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    MAX_RETRIES = 4
+    # Polly's hard limit per request — stay under it with a small buffer
+    POLLY_CHUNK_SIZE = 2800
 
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers["xi-api-key"] = Config.ELEVENLABS_API_KEY
+        self.client = boto3.client("polly", region_name=Config.AWS_REGION)
 
     def convert(self, text: str) -> bytes:
         """
-        Convert text to MP3 bytes. Handles chunking and merging internally.
-        Returns a single MP3 byte string ready to be used in pydub.
+        Convert text to MP3 bytes using AWS Polly.
+        Chunks long text and concatenates the results into one MP3.
         """
         chunks = self._chunk_text(text)
         log.info("TTS: %d chunk(s) for %d total chars", len(chunks), len(text))
+        parts = [self._call_polly(chunk) for chunk in chunks]
+        return b"".join(parts)
 
-        mp3_parts = []
-        for i, chunk in enumerate(chunks):
-            mp3_parts.append(self._call_api(chunk))
-            # Brief pause between API calls to stay within rate limits
-            if i < len(chunks) - 1:
-                time.sleep(Config.ELEVENLABS_RATE_DELAY)
-
-        return self._merge_mp3s(mp3_parts)
-
-    def _call_api(self, text: str, attempt: int = 0) -> bytes:
-        """
-        POST one chunk of text to ElevenLabs.
-        Retries with exponential backoff on HTTP 429 (rate limit exceeded).
-        """
-        url = self.TTS_ENDPOINT.format(voice_id=Config.ELEVENLABS_VOICE_ID)
-        resp = self.session.post(
-            url,
-            json={
-                "text": text,
-                "model_id": "eleven_monolingual_v1",
-                "voice_settings": {
-                    "stability": 0.5,        # 0=more expressive, 1=more consistent
-                    "similarity_boost": 0.75, # how closely to match the voice clone
-                },
-            },
-            timeout=90,  # Long timeout: generating audio takes time for long chunks
+    def _call_polly(self, text: str) -> bytes:
+        """Send one chunk of text to Polly and return raw MP3 bytes."""
+        response = self.client.synthesize_speech(
+            Text=text,
+            OutputFormat="mp3",
+            VoiceId=Config.POLLY_VOICE,
+            Engine=Config.POLLY_ENGINE,
         )
-
-        if resp.status_code == 429:
-            # Rate limited — back off and retry
-            wait_seconds = 2 ** attempt  # 2, 4, 8, 16 seconds
-            log.warning(
-                "ElevenLabs rate limit hit. Waiting %ds (attempt %d/%d).",
-                wait_seconds, attempt + 1, self.MAX_RETRIES,
-            )
-            if attempt >= self.MAX_RETRIES:
-                raise RuntimeError("ElevenLabs: max retries exceeded on rate limit.")
-            time.sleep(wait_seconds)
-            return self._call_api(text, attempt + 1)
-
-        resp.raise_for_status()
-        return resp.content  # Raw MP3 bytes
+        return response["AudioStream"].read()
 
     @staticmethod
     def _chunk_text(text: str) -> List[str]:
         """
-        Split text into chunks no larger than CHUNK_SIZE characters.
-        Breaks at sentence endings ('. ') or word boundaries to avoid
-        cutting words mid-stream in the audio.
+        Split text into chunks no larger than POLLY_CHUNK_SIZE characters.
+        Breaks at sentence boundaries to avoid cutting words mid-audio.
         """
-        limit = Config.ELEVENLABS_CHUNK_SIZE
+        limit = TTSConverter.POLLY_CHUNK_SIZE
         if len(text) <= limit:
             return [text]
 
@@ -483,28 +686,15 @@ class TTSConverter:
             if len(text) <= limit:
                 chunks.append(text)
                 break
-            # Try to break at a sentence boundary first
             cut = text.rfind(". ", 0, limit)
             if cut == -1:
-                # No sentence boundary — try a word boundary
                 cut = text.rfind(" ", 0, limit)
             if cut == -1:
-                # No word boundary either — hard cut (rare edge case)
                 cut = limit
             chunks.append(text[: cut + 1].strip())
-            text = text[cut + 1 :].strip()
+            text = text[cut + 1:].strip()
 
         return chunks
-
-    @staticmethod
-    def _merge_mp3s(parts: List[bytes]) -> bytes:
-        """
-        Concatenate MP3 byte strings into one.
-        MP3 is a streaming format made of independent frames, so joining raw bytes
-        produces a valid file that all standard players handle correctly.
-        No ffmpeg or external library required.
-        """
-        return b"".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -538,10 +728,29 @@ class AudioBuilder:
                 "Building chapter %d/%d: '%s' (%d chars)",
                 i, len(valid_items), item["title"], len(item["text"]),
             )
+            # Truncate very long articles to stay within ElevenLabs quota
+            # and Lambda's execution time limit
+            text = item["text"]
+            if len(text) > Config.MAX_CHARS_PER_ARTICLE:
+                text = text[: Config.MAX_CHARS_PER_ARTICLE]
+                # Cut cleanly at the last sentence boundary
+                cut = text.rfind(". ")
+                if cut > 0:
+                    text = text[: cut + 1]
+                text += "\n\n[Article truncated to fit audio limits.]"
+                log.info(
+                    "Chapter %d truncated to %d chars (was %d)",
+                    i, len(text), len(item["text"]),
+                )
+
             # Merge the spoken chapter title into the content text.
-            # ElevenLabs will read the announcement and then the article
+            # Polly will read the announcement and then the article
             # as one continuous, natural-sounding narration.
-            full_text = f"Chapter {i}. {item['title']}.\n\n{item['text']}"
+            full_text = f"Chapter {i}. {item['title']}.\n\n{text}"
+            log.info(
+                "Chapter %d — first 300 chars sent to Polly: %s",
+                i, repr(full_text[:300]),
+            )
             chapter_audio_parts.append(self.tts.convert(full_text))
 
         # Join all chapter MP3 bytes into one file
@@ -689,9 +898,10 @@ class Orchestrator:
                 log.error(
                     "Pipeline failed for batch '%s': %s", batch_id, exc, exc_info=True
                 )
-                # Mark all items in this batch as failed so we can investigate
-                for item in items:
-                    self.state.mark_status(item["raindrop_id"], "failed")
+                # Leave items as "pending" so the next Lambda run retries automatically.
+                # We only mark individual items "failed" inside _run_pipeline when
+                # content extraction fails for that specific item — not for transient
+                # errors like a wrong API key or a temporary network issue.
 
     def _run_pipeline(self, batch_id: str, items: List[Dict]):
         """

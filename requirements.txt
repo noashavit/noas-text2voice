@@ -13,3 +13,5 @@ requests>=2.31.0
 pdfminer.six>=20221105
 beautifulsoup4>=4.12.3
 boto3>=1.34.0
+trafilatura>=1.12.0
+lxml_html_clean>=0.1.0
