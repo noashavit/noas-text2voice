@@ -4,7 +4,7 @@
 An agent to help you get to all those "read later" items using free tools.
 
 Automatically converts new bookmarks you save to Raindrop.io into an MP3 audiobook and emails it to you. 
-The agent runs every 30 minutes and batches audiobooks based on the bookmarks added in a 5-minute window. It then emails the audio file to you. Totally hands free.
+The agent runs on a schedule you set, for example every 30 minutes, and checks for new bookmarks added with the `Later` tag. It then converts the text to voice and batches the resulting audiobooks into one mp3 file, with each article as a chapter. It then emails the audio file to you. Totally hands free.
 
 Simply save and tag any article or PDF in Raindrop.io with `Later`. The agent batches everything you tagged and converts it to speech using AWS Polly.
 Once converted, the agent sends the audio file straight to your inbox (currently only supporting Gmail).
@@ -14,7 +14,7 @@ Once converted, the agent sends the audio file straight to your inbox (currently
 ## How it works
 
 1. **Tag** any article or PDF in Raindrop.io with `Later`
-2. **Wait**: the agent runs every 30 minutes and batches bookmarks saved within a 5-minute window (so everything you save in one sitting lands in one file)
+2. **Wait**: the agent runs on a schedule and batches bookmarks saved within a 5-minute window (so everything you save in one sitting lands in one file)
 3. **Listen**: a single MP3 arrives in your inbox, with each article announced as a chapter
 
 ---
@@ -109,10 +109,10 @@ Then in Lambda → **Code** tab → **Upload from → .zip file** → select `la
 
 ---
 
-### Step 7 — Set up the 30-minute trigger
+### Step 7 — Set up the timed trigger
 1. In Lambda → **Add trigger** → choose **EventBridge (CloudWatch Events)**
 2. Create a new rule → type: **Schedule expression**
-3. Value: `rate(30 minutes)`
+3. Value: e.g `rate(30 minutes)`to the agent to check for new bookmarks every 30 minutes 
 4. Click **Add**
 
 ---
