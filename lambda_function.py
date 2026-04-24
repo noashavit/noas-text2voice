@@ -533,13 +533,16 @@ class ContentExtractor:
         """
         Fetch a webpage and extract the main readable content.
 
-        Uses trafilatura as the primary extractor — it scores each text block by
-        how much it resembles prose vs. boilerplate (navigation, metadata, ads,
-        code) and discards anything that doesn't look like article content.
-
-        Falls back to BeautifulSoup if trafilatura returns nothing (e.g. paywalled
-        pages or sites that serve a near-empty HTML shell with JS-only content).
+        Extraction chain (each step only runs if the previous returned too little):
+          1. Convert AMP CDN URLs to their canonical form before fetching.
+          2. trafilatura — fast, no JS, excellent for server-rendered pages.
+          3. Jina Reader — free service that renders JS-heavy pages (React/Next.js,
+             Substack, etc.) via a headless browser and returns clean text.
+          4. BeautifulSoup — dumb HTML scrape, last resort.
         """
+        # Step 0: Unwrap AMP CDN URLs before fetching so we get the real article.
+        url = self._deamp_url(url)
+
         log.info("Extracting webpage: %s", url)
         resp = requests.get(url, headers=self.BROWSER_HEADERS, timeout=15)
         resp.raise_for_status()
@@ -560,18 +563,39 @@ class ContentExtractor:
             log.warning("trafilatura raised an exception for %s: %s", url, exc)
             text = None
 
-        if text and text.strip():
+        # Require at least 150 words — fewer likely means navigation fragments,
+        # not a real article (catches JS-rendered pages where requests gets a shell).
+        if text and self._sufficient_content(text):
             log.info(
-                "trafilatura extracted %d chars from %s. Preview: %s",
-                len(text), url, repr(text[:300]),
+                "trafilatura extracted %d chars (%d words) from %s",
+                len(text), len(text.split()), url,
             )
             return self._clean(text)
 
-        log.info("trafilatura returned nothing for %s", url)
+        word_count = len(text.split()) if text else 0
+        log.info(
+            "trafilatura returned only %d word(s) from %s — trying Jina Reader", word_count, url
+        )
 
-        log.info("trafilatura returned nothing for %s — falling back to BeautifulSoup", url)
+        # ── Fallback 1: Jina Reader ─────────────────────────────────────────
+        # r.jina.ai renders the page with a headless browser, then returns clean
+        # article text. Solves JS-heavy sites (React/Next.js, Substack) that
+        # return an empty HTML shell to a plain requests.get() call.
+        jina_text = self._extract_via_jina(url)
+        if jina_text and self._sufficient_content(jina_text):
+            log.info(
+                "Jina Reader extracted %d chars (%d words) from %s",
+                len(jina_text), len(jina_text.split()), url,
+            )
+            return self._clean(jina_text)
 
-        # ── Fallback: BeautifulSoup ─────────────────────────────────────────
+        word_count = len(jina_text.split()) if jina_text else 0
+        log.info(
+            "Jina Reader returned only %d word(s) from %s — falling back to BeautifulSoup",
+            word_count, url,
+        )
+
+        # ── Fallback 2: BeautifulSoup ───────────────────────────────────────
         soup = BeautifulSoup(resp.text, "html.parser")
 
         for tag_name in self.NOISE_TAGS:
@@ -599,6 +623,98 @@ class ContentExtractor:
             return self._clean("\n".join(blocks))
 
         return self._clean(container.get_text(separator="\n"))
+
+    @staticmethod
+    def _deamp_url(url: str) -> str:
+        """
+        Convert Google AMP CDN URLs to the canonical article URL.
+
+        AMP CDN format:  https://{publisher}.cdn.ampproject.org/c/s/{domain}/{path}
+        Canonical format: https://{domain}/{path}  (with /amp/ path segment stripped)
+
+        Example:
+          https://www-cnbc-com.cdn.ampproject.org/c/s/www.cnbc.com/amp/2026/04/21/article.html
+          → https://www.cnbc.com/2026/04/21/article.html
+        """
+        amp_match = re.match(r'https?://[^/]+\.cdn\.ampproject\.org/c/s/(.+)', url)
+        if amp_match:
+            canonical = 'https://' + amp_match.group(1)
+            # Some publishers (e.g. CNBC) use /amp/ in their AMP path — strip it
+            canonical = re.sub(r'/amp/', '/', canonical)
+            log.info("De-AMPed URL: %s → %s", url, canonical)
+            return canonical
+        return url
+
+    @staticmethod
+    def _sufficient_content(text: str) -> bool:
+        """
+        Return True if the text has enough words to be real article content.
+        Fewer than 150 words usually means we got navigation fragments or an
+        empty JS shell rather than the actual article body.
+        """
+        return bool(text) and len(text.split()) >= 150
+
+    def _extract_via_jina(self, url: str) -> str:
+        """
+        Fetch clean article text via Jina Reader (r.jina.ai).
+
+        Jina renders the page with a headless browser before extracting text,
+        which makes it the right tool for React/Next.js sites and other pages
+        that load content via JavaScript. No API key required.
+
+        Jina returns Markdown-formatted text, so we strip formatting symbols
+        before returning — otherwise Polly reads "asterisk asterisk bold text
+        asterisk asterisk" aloud.
+
+        Returns empty string on any failure so callers can fall through cleanly.
+        """
+        jina_url = f"https://r.jina.ai/{url}"
+        log.info("Trying Jina Reader: %s", jina_url)
+        try:
+            resp = requests.get(
+                jina_url,
+                headers={"Accept": "text/plain", **self.BROWSER_HEADERS},
+                timeout=30,  # Jina renders JS so it's slower than a plain fetch
+            )
+            resp.raise_for_status()
+            return self._strip_markdown(resp.text.strip())
+        except Exception as exc:
+            log.warning("Jina Reader failed for %s: %s", url, exc)
+            return ""
+
+    @staticmethod
+    def _strip_markdown(text: str) -> str:
+        """
+        Remove Markdown syntax from Jina Reader output so Polly reads clean prose.
+
+        Jina returns text with bold (**word**), headers (## Heading), links
+        ([text](url)), and code fences — all of which Polly reads as literal
+        symbols. This strips them down to speakable plain text.
+        """
+        # Drop fenced code blocks entirely — code is not speakable prose
+        text = re.sub(r'```[\s\S]*?```', '', text)
+        # Strip inline code backticks but keep the content word
+        text = re.sub(r'`([^`\n]+)`', r'\1', text)
+        # Strip Markdown headers — keep the heading text
+        text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+        # Strip bold and italic markers (**, *, __, _)
+        text = re.sub(r'\*{1,3}([^*\n]+)\*{1,3}', r'\1', text)
+        text = re.sub(r'_{1,3}([^_\n]+)_{1,3}', r'\1', text)
+        # Convert Markdown links [text](url) → text only
+        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+        # Drop image tags entirely
+        text = re.sub(r'!\[[^\]]*\]\([^)]+\)', '', text)
+        # Drop bare URLs (https://... standalone)
+        text = re.sub(r'https?://\S+', '', text)
+        # Strip blockquote markers
+        text = re.sub(r'^>\s*', '', text, flags=re.MULTILINE)
+        # Strip horizontal rules
+        text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
+        # Strip Jina's metadata header lines (Title:, URL Source:, Published Time:)
+        text = re.sub(r'^(Title|URL Source|Published Time|Markdown Content):\s*.*$', '', text, flags=re.MULTILINE)
+        # Collapse runs of blank lines left behind by removals
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
 
     @staticmethod
     def _is_clean_text(text: str) -> bool:

@@ -157,11 +157,23 @@ deploy.sh            Packages the agent into a Lambda-ready ZIP
 | `Config` | Loads all settings from environment variables |
 | `StateManager` | Reads/writes bookmark state to DynamoDB |
 | `RaindropMonitor` | Fetches and filters bookmarks from Raindrop.io |
-| `ContentExtractor` | Extracts article text from web pages (via trafilatura) and PDFs (via pdfminer), with garbled-content filtering and a BeautifulSoup fallback |
+| `ContentExtractor` | Extracts article text from web pages and PDFs using a four-step fallback chain (see below) |
 | `TTSConverter` | Sends text to AWS Polly, handles chunking and retries |
 | `AudioBuilder` | Assembles chapters into a single MP3 |
 | `EmailNotifier` | Sends the MP3 via Gmail SMTP |
 | `Orchestrator` | Wires all modules together |
+
+### Content extraction chain
+
+`ContentExtractor` tries four methods in order, stopping as soon as it gets at least 150 words of clean prose:
+
+| Step | Method | What it handles |
+|---|---|---|
+| 0 | AMP URL transformer | Converts Google AMP CDN links (`cdn.ampproject.org`) to the canonical article URL before fetching |
+| 1 | trafilatura | Fast, no-JavaScript extraction — works well for traditional server-rendered sites |
+| 2 | Jina Reader (`r.jina.ai`) | Renders JavaScript-heavy pages (React, Next.js, Substack) via headless browser, then strips Markdown formatting so Polly reads clean prose |
+| 3 | BeautifulSoup | Basic HTML scrape targeting known prose tags — last resort |
+| 4 | Raindrop excerpt | Uses the short preview Raindrop stores for every bookmark if all else fails |
 
 ## Known limitations
 
