@@ -19,3 +19,5 @@ later_audio_*.mp3
 
 # Claude Code session memory — local to this machine
 memory/
+
+readme.md # Ignore the README.md file
