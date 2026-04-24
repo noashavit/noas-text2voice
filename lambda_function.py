@@ -23,7 +23,6 @@ ENVIRONMENT VARIABLES (set these in Lambda → Configuration → Environment var
   DBTABLE           (optional) Default: text2voice_items
   LATERTAG          (optional) Default: Later
   BATCHDELAY        (optional) Default: 30
-  MAXCHARS          (optional) Default: 30000 — max chars per article before truncating
 
 FREE TIER NOTES:
   - AWS Lambda:    1M requests/month free
@@ -46,7 +45,6 @@ NO LAMBDA LAYER REQUIRED:
 
 import io
 import os
-import time
 import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -54,7 +52,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import re
 from collections import Counter
@@ -105,9 +103,6 @@ class Config:
     # If you get a ValidationException about engine not supported, use "standard".
     POLLY_ENGINE = os.environ.get("POLLYENGINE", "standard")
 
-    # Max characters per article to avoid Lambda timeouts on very long documents
-    # Polly is fast (~1s per chunk) so 30,000 chars is safe within Lambda's 14-min limit
-    MAX_CHARS_PER_ARTICLE = int(os.environ.get("MAXCHARS", "30000"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -844,20 +839,7 @@ class AudioBuilder:
                 "Building chapter %d/%d: '%s' (%d chars)",
                 i, len(valid_items), item["title"], len(item["text"]),
             )
-            # Truncate very long articles to stay within ElevenLabs quota
-            # and Lambda's execution time limit
             text = item["text"]
-            if len(text) > Config.MAX_CHARS_PER_ARTICLE:
-                text = text[: Config.MAX_CHARS_PER_ARTICLE]
-                # Cut cleanly at the last sentence boundary
-                cut = text.rfind(". ")
-                if cut > 0:
-                    text = text[: cut + 1]
-                text += "\n\n[Article truncated to fit audio limits.]"
-                log.info(
-                    "Chapter %d truncated to %d chars (was %d)",
-                    i, len(text), len(item["text"]),
-                )
 
             # Merge the spoken chapter title into the content text.
             # Polly will read the announcement and then the article
