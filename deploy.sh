@@ -9,7 +9,7 @@
 #
 # HOW TO USE:
 #   1. Open Terminal and navigate to this folder:
-#        cd "/Users/noashavit/Claude_Code/Later Text2Voice"
+#        cd /path-to-directory/folder-name/"Later Text2Voice"
 #   2. Make this script executable (one-time):
 #        chmod +x deploy.sh
 #   3. Run it:
