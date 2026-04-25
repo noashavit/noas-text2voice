@@ -2,14 +2,14 @@
 """
 Later Text2Voice — AWS Lambda Agent
 =====================================
-Triggered every 5 minutes by Amazon EventBridge (free).
+Triggered every X minutes by Amazon EventBridge (free).
 State is persisted between runs in Amazon DynamoDB (free tier).
 
 WHAT THIS DOES (plain English):
-  1. Every 5 minutes, checks Raindrop.io for bookmarks tagged "Later"
-  2. Any new ones get queued in DynamoDB with a 30-minute timer
+  1. Every X minutes (you define in the trigger), checks Raindrop.io for bookmarks tagged "Later"
+  2. Any new ones get queued in DynamoDB with a 5-minute timer
   3. Bookmarks added within that 30-minute window are grouped into one audio file
-  4. After 30 minutes, extracts text from each bookmark (PDF or webpage)
+  4. After 5 minutes, extracts text from each bookmark (PDF or webpage)
   5. Converts all text to speech via AWS Polly, with "Chapter N: Title" announcements
   6. Combines everything into one MP3 and emails it to you via Gmail
 
@@ -142,12 +142,12 @@ class StateManager:
 
     def get_or_create_open_batch(self) -> Tuple[str, str]:
         """
-        Find the current open batch (a group of bookmarks still within their 30-min window).
+        Find the current open batch (a group of bookmarks still within their 5-min window).
         If no open batch exists, create a fresh one.
 
         Returns: (batch_id, process_after) — both are ISO timestamp strings.
 
-        WHY: All bookmarks added within the same 30-minute window should be grouped
+        WHY: All bookmarks added within the same 5-minute window should be grouped
         into a single audio file, not sent as separate emails.
         """
         now = datetime.now(timezone.utc)
@@ -954,10 +954,10 @@ class EmailNotifier:
 #
 # Phase 1 — poll():
 #   Ask Raindrop.io "any new 'Later' bookmarks?"
-#   If yes → store them in DynamoDB with a 30-minute countdown
+#   If yes → store them in DynamoDB with a 5-minute countdown
 #
 # Phase 2 — process():
-#   Check DynamoDB: "any batches whose 30-minute window has closed?"
+#   Check DynamoDB: "any batches whose 5-minute window has closed?"
 #   If yes → extract text, convert to speech, build MP3, send email
 # ─────────────────────────────────────────────────────────────────────────────
 class Orchestrator:
@@ -984,7 +984,7 @@ class Orchestrator:
             return
 
         # Get (or create) the currently open batch
-        # All bookmarks added within the 30-min window share the same batch
+        # All bookmarks added within the 5-min window share the same batch
         batch_id, process_after = self.state.get_or_create_open_batch()
 
         for item in new_items:
@@ -996,7 +996,7 @@ class Orchestrator:
 
     # ── Phase 2 ──────────────────────────────────────────────────────────────
     def process(self):
-        """Find batches whose 30-minute window has expired and process them."""
+        """Find batches whose 5-minute window has expired and process them."""
         log.info("=== Phase 2: Checking for batches ready to process ===")
         ready_batches = self.state.get_ready_batches()
 
@@ -1059,7 +1059,7 @@ class Orchestrator:
 # ─────────────────────────────────────────────────────────────────────────────
 # LAMBDA ENTRY POINT
 #
-# AWS Lambda calls this function every 5 minutes (triggered by EventBridge).
+# AWS Lambda calls this function every X minutes (triggered by EventBridge).
 # The `event` and `context` parameters are provided by Lambda automatically —
 # we don't use them here but they're required by the Lambda interface.
 # ─────────────────────────────────────────────────────────────────────────────
