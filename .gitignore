@@ -2,6 +2,7 @@
 package/
 lambda_package/
 lambda_package.zip
+deploy.sh
 
 # Environment secrets — never commit real credentials
 .env
