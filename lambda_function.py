@@ -8,7 +8,7 @@ State is persisted between runs in Amazon DynamoDB (free tier).
 WHAT THIS DOES (plain English):
   1. Every X minutes (you define in the trigger), checks Raindrop.io for bookmarks tagged "Later"
   2. Any new ones get queued in DynamoDB with a 5-minute timer
-  3. Bookmarks added within that 30-minute window are grouped into one audio file
+  3. Bookmarks added within that 5-minute window are grouped into one audio file
   4. After 5 minutes, extracts text from each bookmark (PDF or webpage)
   5. Converts all text to speech via AWS Polly, with "Chapter N: Title" announcements
   6. Combines everything into one MP3 and emails it to you via Gmail
@@ -22,7 +22,7 @@ ENVIRONMENT VARIABLES (set these in Lambda → Configuration → Environment var
   POLLYENGINE       (optional) Default: neural — "neural" sounds natural, "standard" saves quota
   DBTABLE           (optional) Default: text2voice_items
   LATERTAG          (optional) Default: Later
-  BATCHDELAY        (optional) Default: 30
+  BATCHDELAY        (optional) Default: 5
   MAXCHARS          (optional) Default: 30000 — max chars per article before truncating
 
 FREE TIER NOTES:
