@@ -5,6 +5,7 @@ lambda_package.zip
 
 # Environment secrets — never commit real credentials
 .env
+deploy.sh
 
 # macOS system files
 .DS_Store
