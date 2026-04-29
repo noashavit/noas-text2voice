@@ -83,7 +83,6 @@ Once converted, the agent sends the audio file straight to your inbox (currently
 | `BATCHDELAY` | `5` |
 | `POLLYVOICE` | `Joanna` |
 | `POLLYENGINE` | `standard` |
-| `MAXCHARS` | `8000` |
 
 > Type key names directly — do not copy/paste them, as invisible spaces can cause errors.
 
@@ -137,7 +136,6 @@ Then in Lambda → **Code** tab → **Upload from → .zip file** → select `la
 | `BATCHDELAY` | No | `5` | Minutes to wait before processing |
 | `POLLYVOICE` | No | `Joanna` | AWS Polly voice ID |
 | `POLLYENGINE` | No | `standard` | AWS Polly engine (`standard` or `neural`) |
-| `MAXCHARS` | No | `8000` | Max characters per article before truncation |
 
 ---
 

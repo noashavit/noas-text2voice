@@ -392,9 +392,6 @@ class ContentExtractor:
         "nav", "header", "footer", "aside", "script", "style",
         "noscript", "iframe", "figure", "figcaption", "form",
     ]
-    # Characters that appear in code/JSON/CSS but rarely in prose.
-    # If these make up more than 12% of the extracted text, it is likely garbage.
-    CODE_CHARS = set('{}[]\\|<>=_^~`@$')
 
     def extract(self, item: Dict) -> str:
         """
@@ -544,43 +541,52 @@ class ContentExtractor:
         url = self._deamp_url(url)
 
         log.info("Extracting webpage: %s", url)
-        resp = requests.get(url, headers=self.BROWSER_HEADERS, timeout=15)
-        resp.raise_for_status()
 
-        # ── Primary: trafilatura ────────────────────────────────────────────
-        # favor_precision=True tells trafilatura to skip any block it isn't
-        # confident about — we'd rather have less text than garbled text.
+        # ── Primary: direct fetch + trafilatura ────────────────────────────
+        # Wrapped in its own try/except so a 403 or bot-detection block from
+        # the site doesn't prevent Jina from running. Sites protected by
+        # Cloudflare routinely return 403 to Lambda's AWS IP addresses, but
+        # Jina uses its own infrastructure and can still reach them.
+        html = None
         try:
-            text = trafilatura.extract(
-                resp.text,
-                url=url,           # helps trafilatura apply site-specific heuristics
-                include_comments=False,
-                include_tables=False,
-                favor_precision=True,
-                no_fallback=False,  # allow trafilatura's own fallback extractors
-            )
+            resp = requests.get(url, headers=self.BROWSER_HEADERS, timeout=15)
+            resp.raise_for_status()
+            html = resp.text
         except Exception as exc:
-            log.warning("trafilatura raised an exception for %s: %s", url, exc)
-            text = None
-
-        # Require at least 150 words — fewer likely means navigation fragments,
-        # not a real article (catches JS-rendered pages where requests gets a shell).
-        if text and self._sufficient_content(text):
-            log.info(
-                "trafilatura extracted %d chars (%d words) from %s",
-                len(text), len(text.split()), url,
+            log.warning(
+                "Direct fetch failed for %s: %s — skipping trafilatura, trying Jina", url, exc
             )
-            return self._clean(text)
 
-        word_count = len(text.split()) if text else 0
-        log.info(
-            "trafilatura returned only %d word(s) from %s — trying Jina Reader", word_count, url
-        )
+        if html:
+            try:
+                text = trafilatura.extract(
+                    html,
+                    url=url,
+                    include_comments=False,
+                    include_tables=False,
+                    favor_precision=True,
+                    no_fallback=False,
+                )
+            except Exception as exc:
+                log.warning("trafilatura raised an exception for %s: %s", url, exc)
+                text = None
+
+            if text and self._sufficient_content(text):
+                log.info(
+                    "trafilatura extracted %d chars (%d words) from %s",
+                    len(text), len(text.split()), url,
+                )
+                return self._clean(text)
+
+            word_count = len(text.split()) if text else 0
+            log.info(
+                "trafilatura returned only %d word(s) from %s — trying Jina Reader", word_count, url
+            )
 
         # ── Fallback 1: Jina Reader ─────────────────────────────────────────
-        # r.jina.ai renders the page with a headless browser, then returns clean
-        # article text. Solves JS-heavy sites (React/Next.js, Substack) that
-        # return an empty HTML shell to a plain requests.get() call.
+        # Always tried — works even when the direct fetch above was blocked.
+        # Jina renders JS-heavy pages (React/Next.js, Substack) via headless
+        # browser and has its own IP infrastructure that bypasses most blocks.
         jina_text = self._extract_via_jina(url)
         if jina_text and self._sufficient_content(jina_text):
             log.info(
@@ -596,7 +602,12 @@ class ContentExtractor:
         )
 
         # ── Fallback 2: BeautifulSoup ───────────────────────────────────────
-        soup = BeautifulSoup(resp.text, "html.parser")
+        # Only possible if the direct fetch succeeded — skip if html is None.
+        if not html:
+            log.warning("No HTML available for BeautifulSoup — direct fetch was blocked.")
+            return ""
+
+        soup = BeautifulSoup(html, "html.parser")
 
         for tag_name in self.NOISE_TAGS:
             for el in soup.find_all(tag_name):
@@ -658,28 +669,65 @@ class ContentExtractor:
         """
         Fetch clean article text via Jina Reader (r.jina.ai).
 
-        Jina renders the page with a headless browser before extracting text,
-        which makes it the right tool for React/Next.js sites and other pages
-        that load content via JavaScript. No API key required.
+        Jina renders the page with a headless browser, which handles JS-heavy
+        sites that requests.get() can't read. No API key required.
 
-        Jina returns Markdown-formatted text, so we strip formatting symbols
-        before returning — otherwise Polly reads "asterisk asterisk bold text
-        asterisk asterisk" aloud.
+        We make two attempts with different Jina instructions:
 
-        Returns empty string on any failure so callers can fall through cleanly.
+        1. X-Target-Selector — tells Jina to extract ONLY from semantic article
+           containers (<article>, <main>, role="main"). Returns just the article
+           body for well-structured sites (Sequoia, most blogs). Fails with 422
+           on sites that don't use semantic containers.
+
+        2. X-Remove-Selector — if attempt 1 fails or returns too little, asks
+           Jina to strip known noise elements (nav, footer, cookie banners,
+           sidebars) from the full page before extracting. Handles sites like
+           Databricks that don't mark up their article with <article> tags.
+
+        Both paths run through _strip_markdown to remove formatting symbols
+        that Polly would otherwise read aloud as literal characters.
         """
         jina_url = f"https://r.jina.ai/{url}"
-        log.info("Trying Jina Reader: %s", jina_url)
+
+        # Attempt 1: target semantic article containers only
+        log.info("Trying Jina Reader (targeted): %s", jina_url)
         try:
             resp = requests.get(
                 jina_url,
-                headers={"Accept": "text/plain", **self.BROWSER_HEADERS},
-                timeout=30,  # Jina renders JS so it's slower than a plain fetch
+                headers={
+                    "Accept": "text/plain",
+                    "User-Agent": self.BROWSER_HEADERS["User-Agent"],
+                    "X-Target-Selector": "article, main, [role='main'], .post-content, .article-body, .entry-content",
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            text = self._strip_markdown(resp.text.strip())
+            if self._sufficient_content(text):
+                log.info("Jina (targeted) extracted %d words from %s", len(text.split()), url)
+                return text
+            log.info(
+                "Jina (targeted) returned only %d words — trying noise-removal mode", len(text.split())
+            )
+        except Exception as exc:
+            log.warning("Jina (targeted) failed for %s: %s — trying noise-removal mode", url, exc)
+
+        # Attempt 2: remove known noise elements from the full page
+        log.info("Trying Jina Reader (noise-removal): %s", jina_url)
+        try:
+            resp = requests.get(
+                jina_url,
+                headers={
+                    "Accept": "text/plain",
+                    "User-Agent": self.BROWSER_HEADERS["User-Agent"],
+                    "X-Remove-Selector": "nav, header, footer, aside, [role='navigation'], [role='banner'], [role='contentinfo'], .cookie, .consent, .sidebar, .ad, .newsletter-signup",
+                },
+                timeout=30,
             )
             resp.raise_for_status()
             return self._strip_markdown(resp.text.strip())
         except Exception as exc:
-            log.warning("Jina Reader failed for %s: %s", url, exc)
+            log.warning("Jina (noise-removal) failed for %s: %s", url, exc)
             return ""
 
     @staticmethod
@@ -720,19 +768,27 @@ class ContentExtractor:
     def _is_clean_text(text: str) -> bool:
         """
         Return True if the text looks like readable prose.
-        Return False if it appears to be code, JSON, minified CSS, or font garbage.
 
-        We measure what fraction of characters are typical code/symbol characters.
-        Prose articles very rarely exceed 5%. We use 12% as a generous threshold
-        to avoid false positives on articles that discuss code topics.
+        Measures the fraction of non-whitespace characters that are actual
+        letters (a–z, A–Z). English prose sits at 85–95%. Stats-heavy articles
+        (lots of numbers, percentages, dollar amounts) can drop to ~75%.
+        Garbled text — PDF font encoding failures, extracted JSON blobs,
+        minified JS — typically falls below 60%.
+
+        75% gives a safe buffer: catches all garbling while keeping legitimate
+        data-rich articles. Previous approach (checking a fixed set of "code
+        characters") missed garbling that used /)';  instead of {}[]<>=.
         """
         if not text or len(text) < 50:
             return False
-        code_char_count = sum(1 for c in text if c in ContentExtractor.CODE_CHARS)
-        ratio = code_char_count / len(text)
-        if ratio > 0.12:
+        non_space = [c for c in text if not c.isspace()]
+        if not non_space:
+            return False
+        alpha_ratio = sum(1 for c in non_space if c.isalpha()) / len(non_space)
+        if alpha_ratio < 0.75:
             log.warning(
-                "Text sanity check: %.1f%% code characters — treating as garbled.", ratio * 100
+                "Text sanity check: only %.1f%% alphabetic characters — treating as garbled.",
+                alpha_ratio * 100,
             )
             return False
         return True
