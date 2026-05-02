@@ -954,21 +954,29 @@ class EmailNotifier:
     GMAIL_SMTP_HOST = "smtp.gmail.com"
     GMAIL_SMTP_PORT = 587  # TLS port
 
-    def send(self, mp3_bytes: bytes, chapter_count: int, batch_created_at: str):
+    def send(self, mp3_bytes: bytes, chapter_count: int, batch_created_at: str, titles: Optional[List[str]] = None):
         """
         Send the MP3 to yourself as a Gmail attachment.
 
         mp3_bytes:        the audio file content
         chapter_count:    number of articles/chapters in the file
         batch_created_at: ISO timestamp string (used to label the file and subject)
+        titles:           ordered list of article titles included in the MP3
         """
         date_str = batch_created_at[:10]  # Extract "YYYY-MM-DD" from the ISO string
         filename = f"later_audio_{date_str}.mp3"
         subject = f"Your Later Audio — {chapter_count} chapter(s) — {date_str}"
+
+        if titles:
+            title_lines = "\n".join(f"  {i}. {t}" for i, t in enumerate(titles, 1))
+            articles_section = f"Chapters:\n{title_lines}\n\n"
+        else:
+            articles_section = ""
+
         body = (
-            f"Hi,\n\n"
-            f"Your {chapter_count} 'Later' bookmark(s) have been converted to audio.\n"
-            f"Listen to the attached MP3 whenever suits you.\n\n"
+            f"{chapter_count} 'Later' bookmarked article(s) have been converted to audio.\n\n"
+            f"{articles_section}"
+            f"Each article is a chapter in the attached MP3.\n\n"
             f"— Text2Voice Agent"
         )
 
@@ -1103,7 +1111,8 @@ class Orchestrator:
         mp3_bytes = self.builder.build(items_with_text)
 
         # Step 3: Send the email
-        self.notifier.send(mp3_bytes, len(items_with_text), batch_id)
+        titles = [item["title"] for item in items_with_text]
+        self.notifier.send(mp3_bytes, len(items_with_text), batch_id, titles=titles)
 
         # Step 4: Mark all successfully processed items
         for item in items_with_text:
