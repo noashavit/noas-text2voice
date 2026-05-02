@@ -119,8 +119,8 @@ Then in Lambda → **Code** tab → **Upload from → .zip file** → select `la
 ### Step 8 — Test it
 1. Add a bookmark in Raindrop.io and tag it `Later`
 2. In Lambda → **Test** → create a test event → click **Test**
-3. Check the logs — you should see the bookmark detected and queued
-4. After 5 minutes, click **Test** again — the MP3 will be generated and emailed to you
+3. Check the logs. You should see the bookmark detected and queued
+4. After 5 minutes, click **Test** again. The MP3 will be generated and emailed to you
 
 ---
 
@@ -168,9 +168,9 @@ deploy.sh            Packages the agent into a Lambda-ready ZIP
 | Step | Method | What it handles |
 |---|---|---|
 | 0 | AMP URL transformer | Converts Google AMP CDN links (`cdn.ampproject.org`) to the canonical article URL before fetching |
-| 1 | trafilatura | Fast, no-JavaScript extraction — works well for traditional server-rendered sites |
+| 1 | trafilatura | Fast, no-JavaScript extraction that works well for traditional server-rendered sites |
 | 2 | Jina Reader (`r.jina.ai`) | Renders JavaScript-heavy pages (React, Next.js, Substack) via headless browser, then strips Markdown formatting so Polly reads clean prose |
-| 3 | BeautifulSoup | Basic HTML scrape targeting known prose tags — last resort |
+| 3 | BeautifulSoup | Basic HTML scrape targeting known prose tags as a last resort |
 | 4 | Raindrop excerpt | Uses the short preview Raindrop stores for every bookmark if all else fails |
 
 ## Known limitations
