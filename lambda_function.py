@@ -1164,6 +1164,7 @@ class EmailNotifier:
         batch_created_at: str,
         titles: Optional[List[str]] = None,
         links: Optional[List[str]] = None,
+        excerpts: Optional[List[str]] = None,
     ):
         """
         Send the MP3 to yourself as a Gmail attachment.
@@ -1173,6 +1174,7 @@ class EmailNotifier:
         batch_created_at: ISO timestamp string (used to label the file and subject)
         titles:           ordered list of article titles included in the MP3
         links:            ordered list of article URLs (parallel to titles)
+        excerpts:         ordered list of Raindrop excerpts (parallel to titles, may be empty strings)
         """
         date_str = batch_created_at[:10]  # Extract "YYYY-MM-DD" from the ISO string
         filename = f"later_audio_{date_str}.mp3"
@@ -1180,8 +1182,14 @@ class EmailNotifier:
 
         # Build plain-text chapter list
         if titles:
-            plain_lines = "\n".join(f"  {i}. {t}" for i, t in enumerate(titles, 1))
-            plain_section = f"Chapters:\n{plain_lines}\n\n"
+            plain_lines = []
+            for i, t in enumerate(titles, 1):
+                excerpt = (excerpts[i - 1] if excerpts and i - 1 < len(excerpts) else "") or ""
+                line = f"  {i}. {t}"
+                if excerpt:
+                    line += f"\n     {excerpt}"
+                plain_lines.append(line)
+            plain_section = "Chapters:\n" + "\n".join(plain_lines) + "\n\n"
         else:
             plain_section = ""
 
@@ -1192,16 +1200,21 @@ class EmailNotifier:
             f"— Text2Voice Agent"
         )
 
-        # Build HTML chapter list with clickable links
+        # Build HTML chapter list with clickable links and excerpts
         if titles:
             html_items = []
             for i, title in enumerate(titles, 1):
                 url = (links[i - 1] if links and i - 1 < len(links) else "") or ""
+                excerpt = (excerpts[i - 1] if excerpts and i - 1 < len(excerpts) else "") or ""
                 safe_title = html_lib.escape(title)
-                if url:
-                    html_items.append(f'<li><a href="{html_lib.escape(url)}">{safe_title}</a></li>')
-                else:
-                    html_items.append(f"<li>{safe_title}</li>")
+                title_html = (
+                    f'<a href="{html_lib.escape(url)}">{safe_title}</a>' if url else safe_title
+                )
+                excerpt_html = (
+                    f'<br><span style="color:#666;font-size:0.9em">{html_lib.escape(excerpt)}</span>'
+                    if excerpt else ""
+                )
+                html_items.append(f"<li>{title_html}{excerpt_html}</li>")
             html_section = (
                 "<p><strong>Chapters:</strong></p>\n<ol>\n"
                 + "\n".join(html_items)
@@ -1357,7 +1370,8 @@ class Orchestrator:
         # Step 3: Send the email
         titles = [item["title"] for item in items_with_text]
         links = [item.get("link", "") for item in items_with_text]
-        self.notifier.send(mp3_bytes, len(items_with_text), batch_id, titles=titles, links=links)
+        excerpts = [item.get("excerpt", "") for item in items_with_text]
+        self.notifier.send(mp3_bytes, len(items_with_text), batch_id, titles=titles, links=links, excerpts=excerpts)
 
         # Step 4: Mark all successfully processed items
         for item in items_with_text:
