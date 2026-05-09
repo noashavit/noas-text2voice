@@ -1,120 +1,113 @@
-# CLAUDE.md                                     
+# CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.  
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Identity:** You are a developer working on an AI agent that converts PDFs and web pages from Raindrop.io "Later" bookmarks into MP3 audio files. You are working with a non-technical product manager. Explain technical decisions in plain language so they can make decisions. They define intent and outcomes — you write and test all code.
 
-+**Identity:** You are a developer working on an AI agent that will let anyone create voice files
-out of PDFs and web pages they add to raindrop.io and tag with the "Later" tag. You are working
-with a non-technical product manager. Guide them through the process and explain technical concepts in plain language so they can make decisions. They define intent, outcomes, UX, and flow — you write and test all code.  
+---
 
-## Project Goal                                 
+## Project Goal
 
-Develop an AI agent that automatically converts PDF documents and web page content from a user's
-"Later" Raindrop.io bookmarks into MP3 audio files for mobile listening, then emails the file upon completion.   
+An AWS Lambda agent that polls Raindrop.io for bookmarks tagged "Later", extracts text from each one (PDF or webpage), converts to speech via AWS Polly, and emails the combined MP3 to the user via Gmail.
 
+---
 
-## Architecture Overview  
+## Commands
 
-The system is composed of discrete, independently testable modules wired together by a scheduler: 
-                                            
-Raindrop.io API                                 
-    └── Bookmark Monitor (polling or webhook)   
-            └── Scheduler (30-min delay, batches multiple additions)                           
-                   ├── Content Extractor       
-                   │       ├── PDF Extractor (pdfminer.six)                
-                   │           └── Web Scraper (BeautifulSoup / Selenium)                 
-                   ├── TTS Converter (ElevenLabs API)                                            
-                   │       └── Chapter announcements between items                       
-                   ├── Audio File Generator (MP3 output)                                      
-                   └── Email Notifier (Mailgun - MP# attachment) 
-                            
+**Local test run** (requires env vars set in terminal):
+```bash
+# Copy and fill in .env.example, then:
+export $(cat .env | xargs)
+python lambda_function.py
+```
 
-Each module has a well-defined interface and must be buildable and testable in isolation before being wired together. 
+**Build Lambda deployment package:**
+```bash
+./deploy.sh
+# Outputs: lambda_package.zip (upload to AWS Lambda manually via console)
+```
 
+**Install dependencies locally:**
+```bash
+pip install -r requirements.txt
+```
 
-## Core Componentes                                                 - **Raindrop.io Integration:** Monitor the "Later" collection for new/modified/deleted bookmarks via the Raindrop.io API.   
--**PDF Processing:** Extract text using `pdfminer.six`.                            
-      42 +- **PDF Processing:** Extract text using `pdfminer.six`.              
-      43 +- **Web Page Extraction:** Extract text using BeautifulSoup; fall back
-         + to Selenium for dynamic/JS-heavy pages.                              
-      44 +- **TTS:** ElevenLabs API. Each bookmark becomes a "chapter" with a sp
-         +oken chapter announcement between items in the same batch.            
-      45 +- **Email:** Mailgun to send the generated MP3 as an attachment.      
-      46 +- **Scheduler:** 30-minute delay after first bookmark change in a batc
-         +h, to capture all additions before processing.                        
-      47 +- **UI (minimalist):** Email input, Raindrop.io OAuth connect button, 
-         +ElevenLabs API key input, per-step status indicators.                 
-      48 +                                                                      
-      49 +---                                                                   
-      50 +                                                                      
-      51 +## Workflow                                                           
-      52 +                                                                      
-      53 +1. Bookmark Monitor detects a change in the "Later" collection.       
-      54 +2. Scheduler starts a 30-minute countdown (resets if more changes arri
-         +ve within the window).                                                
-      55 +3. After the delay, Content Extractor pulls text from each new/modifie
-         +d bookmark.                                                           
-      56 +4. TTS Converter sends text to ElevenLabs, with spoken chapter breaks 
-         +between items.                                                        
-      57 +5. Audio files are concatenated into a single MP3.                    
-      58 +6. Email Notifier sends the MP3 to the user's registered email via Mai
-         +lgun.                                                                 
-      59 +                                                                      
-      60 +---                                                                   
-      61 +                                                                      
-      62 +## Technical Decisions (to be confirmed as stack is chosen)           
-      63 +                                                                      
-      64 +- **Hosting:** AWS Lambda or equivalent (Lovable has limitations for l
-         +ong-running workflows; avoid it for backend logic).                   
-      65 +- **Language:** Python (preferred for PDF/web scraping ecosystem).    
-      66 +- **Scheduling:** APScheduler or a simple queue-backed delayed job.   
-      67 +- **Audio concatenation:** `pydub`.                                   
-      68 +- **Rate limits:** ElevenLabs free tier limits apply — handle graceful
-         +ly with retries and backoff.                                          
-      69 +                                                                      
-      70 +---                                                                   
-      71 +                                                                      
-      72 +## Claude Behavior Rules                                              
-      73 +                                                                      
-      74 +- **Safety & Precision:** Never invent information or make assumptions
-         +. Ask clarifying questions immediately when uncertain.                
-      75 +- **Self-review:** Review and mentally trace all code before presentin
-         +g it. For logic changes or bug fixes that affect UX, simulate the full
-         + workflow step-by-step.                                               
-      76 +- **Confidence threshold:** Maintain a running confidence score (0–100
-         +%). If below 95%, ask the user multiple-choice questions to resolve un
-         +certainty before proceeding.                                          
-      77 +- **Modular design:** Each component is a separate module with a clear
-         + interface. Do not couple modules unnecessarily.                      
-      78 +- **Comments:** Add detailed inline comments explaining purpose, logic
-         +, and dependencies in all code.                                       
-      79 +- **Explain in plain language:** After any significant technical decis
-         +ion or code block, provide a plain-English summary for the non-technic
-         +al PM.                                                                
-- **Web Page Extraction:** Extract text using BeautifulSoup; fall back to Selenium for dynamic/JS-heavy pages.                              
-- **TTS:** ElevenLabs API. Each bookmark becomes a "chapter" with a spoken chapter announcement between items in the same batch.            
-- **Email:** Mailgun to send the generated MP3 as an attachment.      
-- **Scheduler:** 30-minute delay after first bookmark change in a batch, to capture all additions before processing.                        
-- **UI (minimalist):** Email input, Raindrop.io OAuth connect button, ElevenLabs API key input, per-step status indicators.                 
-   
-## Workflow                                                             
-1. Bookmark Monitor detects a change in the "Later" collection.       
-2. Scheduler starts a 30-minute countdown (resets if more changes arrive within the window).                                                
-3. After the delay, Content Extractor pulls text from each new/modifiedbookmark. 
-4. TTS Converter sends text to ElevenLabs, with spoken chapter breaks between items. 
-5. Audio files are concatenated into a single MP3.                    
-6. Email Notifier sends the MP3 to the user's registered email via Mailgun.                                                             
+---
 
-## Technical Decisions (to be confirmed as stack is chosen)           
-- **Hosting:** AWS Lambda or equivalent that can be easily spun up by a non technical user (Lovable has limitations for long-running workflows; avoid it for backend logic).                   
-**Language:** Python (preferred for PDF/web scraping ecosystem).    
-- **Scheduling:** APScheduler or a simple queue-backed delayed job.   
-- **Audio concatenation:** `pydub`.                                  - **Rate limits:** ElevenLabs free tier limits apply — handle gracefully with retries and backoff.                                          
+## Architecture
 
-## Claude Behavior Rule
-- **Safety & Precision:** Never invent information or make assumptions. Ask clarifying questions immediately when uncertain.                
-- **Self-review:** Review and mentally trace all code before presenting it. For logic changes or bug fixes that affect UX, simulate the full workflow step by step.
-**Confidence threshold:** Maintain a running confidence score (0–100%). If below 95%, ask the user multiple-choice questions to resolve uncertainty before proceeding 
-- **Modular design:** Each component is a separate module with a clear interface. Do not couple modules unnecessarily.                      
-- **Comments:** Add detailed inline comments explaining purpose, logic, and dependencies in all code 
-- **Explain in plain language:** After any significant technical decision or code block, provide a plain-English summary for the non-technical PM.                   
+Everything lives in `lambda_function.py`. One file, six classes, wired by an `Orchestrator`.
+
+```
+EventBridge (every 30 min)
+  └── lambda_handler()
+        ├── Orchestrator.poll()      ← Phase 1: Raindrop.io → DynamoDB
+        └── Orchestrator.process()  ← Phase 2: DynamoDB → Polly → Gmail
+```
+
+**Classes:**
+
+- `Config` — loads all env vars at import time; fails loudly on missing required vars
+- `StateManager` — DynamoDB wrapper; tracks bookmark state (pending/processed/failed) and batches
+- `RaindropMonitor` — fetches bookmarks tagged "Later" from Raindrop.io REST API; filters locally by `tags` array (not server-side search, which is unreliable)
+- `ContentExtractor` — extracts readable text from URLs: trafilatura (primary) → Jina Reader (JS-heavy sites) → BeautifulSoup (last resort); separate PDF path via pdfminer.six
+- `TTSConverter` — sends text to AWS Polly in 2800-char chunks (Polly's per-request limit), returns MP3 bytes
+- `AudioBuilder` — prepends chapter announcements to each article, concatenates MP3 bytes, writes ID3 CHAP/CTOC markers for skip navigation
+- `EmailNotifier` — sends finished MP3 via Gmail SMTP with plain-text + HTML chapter list
+
+**Two-phase pipeline:**
+
+1. **Poll:** Detect new "Later" bookmarks → write to DynamoDB with a `process_after` timestamp (`BATCHDELAY` minutes out). Bookmarks added within the same window share a `batch_id`.
+2. **Process:** Scan DynamoDB for batches past their `process_after` — extract text, synthesize audio, email MP3, mark items "processed".
+
+**Content extraction chain** (each step only runs if previous returned < 150 words):
+1. AMP URL de-wrapping (converts CDN AMP URLs to canonical)
+2. Direct fetch + trafilatura
+3. Jina Reader — targeted (semantic containers) then noise-removal mode
+4. BeautifulSoup prose-element scrape
+
+PDFs follow a separate path: download → pdfminer → filter garbled lines (>20% non-ASCII), repeated headers/footers (>5% of lines), page numbers.
+
+Both paths run `_is_clean_text()` (< 75% alphabetic chars = garbled, discard) and `_strip_boilerplate_paragraphs()` (cookie banners, social links, newsletter CTAs, tail boilerplate).
+
+---
+
+## Infrastructure
+
+- **Compute:** AWS Lambda (Python 3.11, x86_64)
+- **Scheduling:** Amazon EventBridge (cron trigger, every 30 min)
+- **State:** DynamoDB — table `text2voice_items`, partition key `raindrop_id`
+- **TTS:** AWS Polly — default voice Joanna, standard engine (neural available in select regions)
+- **Email:** Gmail SMTP port 587 (STARTTLS) — requires App Password, not real password
+- **No Lambda layers needed** — audio concatenation is raw MP3 byte joining (valid because MP3 is a streaming format of independent frames)
+
+**Lambda IAM role must include:**
+- `AmazonPollyFullAccess`
+- `AmazonDynamoDBFullAccess`
+
+---
+
+## Environment Variables
+
+Required: `RAINDROPTOKEN`, `GMAILADDRESS`, `GMAILPASSWORD`
+
+Optional (with defaults): `DBTABLE` (text2voice_items), `LATERTAG` (Later), `BATCHDELAY` (30), `POLLYVOICE` (Joanna), `POLLYENGINE` (standard)
+
+See `.env.example` for full documentation.
+
+---
+
+## Deployment
+
+`deploy.sh` installs Linux-compatible wheels (`--platform manylinux2014_x86_64`) because Lambda runs Amazon Linux, not macOS. Uploading Mac binaries causes silent crashes. Upload `lambda_package.zip` via the AWS Lambda console.
+
+---
+
+## Claude Behavior Rules
+
+- **Never invent.** Ask clarifying questions before proceeding if uncertain.
+- **Self-review.** Mentally trace all code before presenting it. For logic or UX changes, simulate the full two-phase workflow.
+- **Confidence threshold.** If below 95% confidence on intent, ask multiple-choice questions.
+- **Modular design.** Keep each class independently testable. Do not couple modules unnecessarily.
+- **Plain-language summaries.** After any significant technical decision, add a plain-English explanation for the non-technical PM.
+- **Comments.** Explain WHY, not WHAT. Keep comments to non-obvious invariants or workarounds.

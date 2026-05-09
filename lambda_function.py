@@ -23,8 +23,6 @@ ENVIRONMENT VARIABLES (set these in Lambda → Configuration → Environment var
   DBTABLE           (optional) Default: text2voice_items
   LATERTAG          (optional) Default: Later
   BATCHDELAY        (optional) Default: 5
-  MAXCHARS          (optional) Default: 30000 — max chars per article before truncating
-
 FREE TIER NOTES:
   - AWS Lambda:    1M requests/month free
   - DynamoDB:      25 GB free forever
@@ -44,8 +42,10 @@ NO LAMBDA LAYER REQUIRED:
   Audio is handled using pure Python and raw byte concatenation — no ffmpeg needed.
 """
 
+import html as html_lib
 import io
 import os
+import tempfile
 import time
 import logging
 import smtplib
@@ -60,6 +60,8 @@ import re
 from collections import Counter
 
 import boto3
+import mutagen.mp3
+from mutagen.id3 import ID3, CHAP, CTOC, TIT2, CTOCFlags
 import requests
 import trafilatura
 from botocore.exceptions import ClientError
@@ -105,9 +107,6 @@ class Config:
     # If you get a ValidationException about engine not supported, use "standard".
     POLLY_ENGINE = os.environ.get("POLLYENGINE", "standard")
 
-    # Max characters per article to avoid Lambda timeouts on very long documents
-    # Polly is fast (~1s per chunk) so 30,000 chars is safe within Lambda's 14-min limit
-    MAX_CHARS_PER_ARTICLE = int(os.environ.get("MAXCHARS", "30000"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -703,6 +702,7 @@ class ContentExtractor:
             )
             resp.raise_for_status()
             text = self._strip_markdown(resp.text.strip())
+            text = self._strip_boilerplate_paragraphs(text)
             if self._sufficient_content(text):
                 log.info("Jina (targeted) extracted %d words from %s", len(text.split()), url)
                 return text
@@ -725,7 +725,8 @@ class ContentExtractor:
                 timeout=30,
             )
             resp.raise_for_status()
-            return self._strip_markdown(resp.text.strip())
+            text = self._strip_markdown(resp.text.strip())
+            return self._strip_boilerplate_paragraphs(text)
         except Exception as exc:
             log.warning("Jina (noise-removal) failed for %s: %s", url, exc)
             return ""
@@ -759,7 +760,7 @@ class ContentExtractor:
         # Strip horizontal rules
         text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
         # Strip Jina's metadata header lines (Title:, URL Source:, Published Time:)
-        text = re.sub(r'^(Title|URL Source|Published Time|Markdown Content):\s*.*$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^(Title|URL Source|Published Time|Markdown Content):[ \t]*.*$', '', text, flags=re.MULTILINE)
         # Collapse runs of blank lines left behind by removals
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
@@ -792,6 +793,152 @@ class ContentExtractor:
             )
             return False
         return True
+
+    @staticmethod
+    def _strip_boilerplate_paragraphs(text: str) -> str:
+        """
+        Remove boilerplate paragraphs from extracted text before passing to Polly.
+
+        Runs after every extraction method (trafilatura, Jina, BeautifulSoup) as a
+        final pass. Works on content patterns rather than CSS selectors, so it handles
+        any site without needing site-specific rules.
+
+        What it removes:
+        - Cookie / GDPR consent blocks  ("We use cookies... Accept All... Reject All")
+        - Cookie table entries          ("Cookie _ga / Duration 1 year / Description...")
+        - Jina image markers            ("!Image 4: Revisit consent button")
+        - UI fragment labels            ("Necessary Always Active", "Functional")
+        - Social link rows              (short paragraph naming 2+ social platforms)
+        - Newsletter CTAs               (subscribe + email/newsletter)
+        - Known boilerplate openers     ("Related:", "Follow us", "Tags:", etc.)
+        """
+        COOKIE_WORDS = {
+            "cookie", "cookies", "consent", "gdpr", "accept all",
+            "reject all", "customise", "customize", "privacy preferences",
+            "duration",  # cookie table entries always list a Duration field
+        }
+        SOCIAL_WORDS = {
+            "twitter", "linkedin", "facebook", "instagram", "youtube",
+            "bluesky", "threads", "hachyderm", "spotify", "mastodon",
+        }
+        NEWSLETTER_WORDS = {
+            "subscribe", "newsletter", "sign up", "sign-up",
+            "enter your email", "roundup",
+        }
+        NOISE_OPENERS = {
+            "related:", "read more:", "you might also like", "more from",
+            "follow tns", "follow us", "share this", "tags:", "topics:",
+            "filed under:", "posted in:", "written by:",
+        }
+
+        paragraphs = text.split("\n\n")
+        clean = []
+
+        for para in paragraphs:
+            lower = para.lower().strip()
+            if not lower:
+                continue
+
+            word_count = len(lower.split())
+
+            # Jina image markers (e.g. "!Image 4: Revisit consent button")
+            if re.match(r'^!image\s+\d+:', lower):
+                continue
+
+            # Pure UI fragment labels: ≤ 3 words, no sentence-ending punctuation.
+            # Catches cookie panel category headers ("Necessary Always Active",
+            # "Functional", "Analytics") and Markdown checkbox lines ("- [x]").
+            if word_count <= 3 and not re.search(r'[.!?]', para):
+                continue
+
+            # Cookie/consent block: 2+ consent-related keywords in one paragraph.
+            # "duration" is always present in cookie table rows, so each entry
+            # ("Cookie _ga / Duration 1 year / Description...") scores ≥ 2.
+            if sum(1 for kw in COOKIE_WORDS if kw in lower) >= 2:
+                continue
+
+            # Social links block: 2+ social platform names in a short paragraph
+            if sum(1 for sw in SOCIAL_WORDS if sw in lower) >= 2 and word_count < 60:
+                continue
+
+            # Newsletter CTA: 2+ subscribe-related phrases in a short paragraph
+            if sum(1 for ph in NEWSLETTER_WORDS if ph in lower) >= 2 and word_count < 80:
+                continue
+
+            # Known boilerplate openers
+            if any(lower.startswith(opener) for opener in NOISE_OPENERS):
+                continue
+
+            clean.append(para)
+
+        # Long-paragraph anchoring: find the first point in the remaining
+        # paragraphs where 3 consecutive paragraphs all have > 30 words.
+        # Cookie panels, registration forms, and survey questions consist of
+        # short chunks that survive keyword filtering. Article prose consistently
+        # produces clusters of long paragraphs. Skipping to that cluster ensures
+        # Polly starts reading article content, not popup residue.
+        # Only applied when there is enough content to make the heuristic safe.
+        if len(clean) > 6:
+            anchor = 0
+            for i in range(len(clean) - 1):
+                if (len(clean[i].split()) > 30
+                        and len(clean[i + 1].split()) > 30):
+                    anchor = i
+                    break
+            if anchor > 0:
+                log.info(
+                    "_strip_boilerplate_paragraphs: anchoring to paragraph %d "
+                    "(skipping %d short/popup paragraphs before article prose)",
+                    anchor, anchor,
+                )
+                clean = clean[anchor:]
+
+        # Trim boilerplate appended after the article body (subscribe CTAs,
+        # media ownership disclaimers, copyright notices). Walk backwards and
+        # drop each matching tail paragraph until we hit real article content.
+        # The word_count guard prevents accidentally cutting a real short ending.
+        def _is_tail_boilerplate(para_lower: str) -> bool:
+            wc = len(para_lower.split())
+            if wc >= 80:
+                return False
+            # YouTube subscribe CTA
+            if "youtube" in para_lower and any(
+                kw in para_lower for kw in ("subscribe", "subscribers", "channel")
+            ):
+                return True
+            # "Join our community" CTA
+            if "join our community" in para_lower:
+                return True
+            # Media brand ownership disclaimer
+            if any(ph in para_lower for ph in (
+                "media brand", "owned by insight", "insight partners",
+                "a brand of", "all rights reserved",
+            )):
+                return True
+            # "The New Stack is..." masthead line
+            if para_lower.startswith("the new stack is") or para_lower.startswith("tns is"):
+                return True
+            # Copyright symbol
+            if re.search(r'©|\bcopyright\b', para_lower):
+                return True
+            # Social follow CTA (e.g. "Follow TNS on LinkedIn, Twitter and YouTube.")
+            if re.search(r'\bfollow\b.{0,40}\b(us|tns|the new stack)\b', para_lower):
+                return True
+            return False
+
+        while clean and _is_tail_boilerplate(clean[-1].lower().strip()):
+            log.debug(
+                "_strip_boilerplate_paragraphs: trimming tail: %s...",
+                clean[-1][:60],
+            )
+            clean.pop()
+
+        result = "\n\n".join(clean)
+        log.debug(
+            "_strip_boilerplate_paragraphs: %d → %d paragraphs kept",
+            len(paragraphs), len(clean),
+        )
+        return result
 
     @staticmethod
     def _clean(text: str) -> str:
@@ -874,7 +1021,7 @@ class TTSConverter:
 #
 # Assembles the final MP3 from individual per-bookmark audio clips.
 # The chapter announcement ("Chapter 1. Title.") is prepended directly to the
-# text before sending to ElevenLabs, so the voice reads it naturally as part
+# text before sending to Polly, so the voice reads it naturally as part
 # of the same audio clip — no audio editing library needed.
 #
 # Each chapter's MP3 bytes are concatenated in sequence. MP3 is a streaming
@@ -887,33 +1034,21 @@ class AudioBuilder:
 
     def build(self, items_with_text: List[Dict]) -> bytes:
         """
-        Build the final combined MP3.
+        Build the final combined MP3 with ID3 chapter markers for skip navigation.
 
         items_with_text: list of dicts, each with 'title' and 'text' keys.
-        Returns: single MP3 byte string with all chapters in sequence.
+        Returns: single MP3 byte string with all chapters in sequence plus ID3 CHAP tags.
         """
         valid_items = [it for it in items_with_text if it.get("text", "").strip()]
         chapter_audio_parts = []
+        chapter_titles = []
 
         for i, item in enumerate(valid_items, start=1):
             log.info(
                 "Building chapter %d/%d: '%s' (%d chars)",
                 i, len(valid_items), item["title"], len(item["text"]),
             )
-            # Truncate very long articles to stay within ElevenLabs quota
-            # and Lambda's execution time limit
             text = item["text"]
-            if len(text) > Config.MAX_CHARS_PER_ARTICLE:
-                text = text[: Config.MAX_CHARS_PER_ARTICLE]
-                # Cut cleanly at the last sentence boundary
-                cut = text.rfind(". ")
-                if cut > 0:
-                    text = text[: cut + 1]
-                text += "\n\n[Article truncated to fit audio limits.]"
-                log.info(
-                    "Chapter %d truncated to %d chars (was %d)",
-                    i, len(text), len(item["text"]),
-                )
 
             # Merge the spoken chapter title into the content text.
             # Polly will read the announcement and then the article
@@ -924,11 +1059,79 @@ class AudioBuilder:
                 i, repr(full_text[:300]),
             )
             chapter_audio_parts.append(self.tts.convert(full_text))
+            chapter_titles.append(item["title"])
 
         # Join all chapter MP3 bytes into one file
         combined = b"".join(chapter_audio_parts)
         log.info("Final audio assembled: %d chapter(s), %.1f MB", len(valid_items), len(combined) / 1_000_000)
-        return combined
+
+        # Embed ID3 chapter markers so players can skip forward/back between articles
+        try:
+            tagged = self._add_chapter_markers(combined, chapter_titles, chapter_audio_parts)
+            log.info("ID3 chapter markers written for %d chapter(s)", len(chapter_titles))
+            return tagged
+        except Exception as exc:
+            log.warning("Could not write ID3 chapter markers: %s — returning untagged MP3", exc)
+            return combined
+
+    @staticmethod
+    def _add_chapter_markers(
+        combined_bytes: bytes,
+        titles: List[str],
+        chapter_parts: List[bytes],
+    ) -> bytes:
+        """
+        Write ID3 CHAP and CTOC frames to the combined MP3.
+
+        Compatible players (Overcast, Pocket Casts, Apple Podcasts, VLC) will
+        show a chapter list and allow skipping forward/back between articles.
+
+        Uses a temp file in /tmp because mutagen.mp3.MP3.save() is most reliable
+        with a named file rather than a BytesIO.
+        """
+        # Calculate where each chapter starts in the combined audio (milliseconds)
+        boundaries_ms = [0]
+        for part in chapter_parts:
+            duration_ms = int(mutagen.mp3.MP3(io.BytesIO(part)).info.length * 1000)
+            boundaries_ms.append(boundaries_ms[-1] + duration_ms)
+
+        # Write combined bytes to a temp file, tag it, read it back.
+        # mkstemp() creates the file with 0600 permissions and returns an open
+        # fd — safer than NamedTemporaryFile(delete=False) against TOCTOU races.
+        fd, tmppath = tempfile.mkstemp(suffix=".mp3")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(combined_bytes)
+            audio = mutagen.mp3.MP3(tmppath)
+            if audio.tags is None:
+                audio.add_tags()
+
+            chapter_ids = []
+            for i, title in enumerate(titles):
+                chap_id = f"chp{i}"
+                chapter_ids.append(chap_id)
+                audio.tags.add(CHAP(
+                    element_id=chap_id,
+                    start_time=boundaries_ms[i],
+                    end_time=boundaries_ms[i + 1],
+                    start_offset=0xFFFFFFFF,
+                    end_offset=0xFFFFFFFF,
+                    sub_frames=[TIT2(encoding=3, text=[title])],
+                ))
+
+            audio.tags.add(CTOC(
+                element_id="toc",
+                flags=CTOCFlags.TOP_LEVEL | CTOCFlags.ORDERED,
+                child_element_ids=chapter_ids,
+                sub_frames=[TIT2(encoding=3, text=["Contents"])],
+            ))
+
+            audio.save(tmppath)
+
+            with open(tmppath, "rb") as f:
+                return f.read()
+        finally:
+            os.unlink(tmppath)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -954,7 +1157,14 @@ class EmailNotifier:
     GMAIL_SMTP_HOST = "smtp.gmail.com"
     GMAIL_SMTP_PORT = 587  # TLS port
 
-    def send(self, mp3_bytes: bytes, chapter_count: int, batch_created_at: str, titles: Optional[List[str]] = None):
+    def send(
+        self,
+        mp3_bytes: bytes,
+        chapter_count: int,
+        batch_created_at: str,
+        titles: Optional[List[str]] = None,
+        links: Optional[List[str]] = None,
+    ):
         """
         Send the MP3 to yourself as a Gmail attachment.
 
@@ -962,30 +1172,64 @@ class EmailNotifier:
         chapter_count:    number of articles/chapters in the file
         batch_created_at: ISO timestamp string (used to label the file and subject)
         titles:           ordered list of article titles included in the MP3
+        links:            ordered list of article URLs (parallel to titles)
         """
         date_str = batch_created_at[:10]  # Extract "YYYY-MM-DD" from the ISO string
         filename = f"later_audio_{date_str}.mp3"
         subject = f"Your Later Audio — {chapter_count} chapter(s) — {date_str}"
 
+        # Build plain-text chapter list
         if titles:
-            title_lines = "\n".join(f"  {i}. {t}" for i, t in enumerate(titles, 1))
-            articles_section = f"Chapters:\n{title_lines}\n\n"
+            plain_lines = "\n".join(f"  {i}. {t}" for i, t in enumerate(titles, 1))
+            plain_section = f"Chapters:\n{plain_lines}\n\n"
         else:
-            articles_section = ""
+            plain_section = ""
 
-        body = (
+        plain_body = (
             f"{chapter_count} 'Later' bookmarked article(s) have been converted to audio.\n\n"
-            f"{articles_section}"
+            f"{plain_section}"
             f"Each article is a chapter in the attached MP3.\n\n"
             f"— Text2Voice Agent"
         )
 
-        # Build the email using Python's standard email library
-        msg = MIMEMultipart()
+        # Build HTML chapter list with clickable links
+        if titles:
+            html_items = []
+            for i, title in enumerate(titles, 1):
+                url = (links[i - 1] if links and i - 1 < len(links) else "") or ""
+                safe_title = html_lib.escape(title)
+                if url:
+                    html_items.append(f'<li><a href="{html_lib.escape(url)}">{safe_title}</a></li>')
+                else:
+                    html_items.append(f"<li>{safe_title}</li>")
+            html_section = (
+                "<p><strong>Chapters:</strong></p>\n<ol>\n"
+                + "\n".join(html_items)
+                + "\n</ol>\n"
+            )
+        else:
+            html_section = ""
+
+        html_body = (
+            "<html><body>"
+            f"<p>{chapter_count} &#8216;Later&#8217; bookmarked article(s) have been converted to audio.</p>\n"
+            f"{html_section}"
+            "<p>Each article is a chapter in the attached MP3.</p>\n"
+            "<p>&#8212; Text2Voice Agent</p>"
+            "</body></html>"
+        )
+
+        # Build the email: multipart/mixed wraps multipart/alternative (text+HTML) + attachment
+        msg = MIMEMultipart("mixed")
         msg["From"] = Config.GMAIL_ADDRESS
         msg["To"] = Config.GMAIL_ADDRESS  # Sending to yourself
         msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
+
+        # multipart/alternative lets the email client pick plain or HTML
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(plain_body, "plain"))
+        alt.attach(MIMEText(html_body, "html"))
+        msg.attach(alt)
 
         # Attach the MP3 file
         attachment = MIMEBase("audio", "mpeg")
@@ -1112,7 +1356,8 @@ class Orchestrator:
 
         # Step 3: Send the email
         titles = [item["title"] for item in items_with_text]
-        self.notifier.send(mp3_bytes, len(items_with_text), batch_id, titles=titles)
+        links = [item.get("link", "") for item in items_with_text]
+        self.notifier.send(mp3_bytes, len(items_with_text), batch_id, titles=titles, links=links)
 
         # Step 4: Mark all successfully processed items
         for item in items_with_text:
